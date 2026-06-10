@@ -1,0 +1,22 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "kruby-controller"
+
+command = ARGV.shift
+
+case command
+when "init"
+  KrubyController::CLI::InitCommand.new(ARGV).run
+when "create"
+  case ARGV.shift
+  when "api"
+    KrubyController::CLI::CreateApiCommand.new(ARGV).run
+  else
+    puts "Unknown create subcommand: #{ARGV.first}"
+    exit 1
+  end
+else
+  puts "Usage: kruby-controller {init|create api}"
+  exit 1
+end

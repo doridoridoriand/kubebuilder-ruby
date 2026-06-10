@@ -1,0 +1,45 @@
+# frozen_string_literal: true
+
+module KrubyController
+  module Queue
+    class WorkQueue
+      def initialize
+        @queue = Queue.new
+        @known = Set.new
+        @mutex = Mutex.new
+        @closed = false
+      end
+
+      def add(request)
+        return if @closed
+        key = request.namespaced_name.to_s
+        @mutex.synchronize do
+          return if @known.include?(key)
+          @known.add(key)
+          @queue << request
+        end
+      end
+
+      def add_after(request, seconds)
+        Thread.new { sleep seconds; add(request) }
+      end
+
+      def get
+        @queue.pop
+      end
+
+      def done(request)
+        key = request.namespaced_name.to_s
+        @mutex.synchronize { @known.delete(key) }
+      end
+
+      def len
+        @queue.length
+      end
+
+      def shutdown
+        @closed = true
+      end
+    end
+  end
+end

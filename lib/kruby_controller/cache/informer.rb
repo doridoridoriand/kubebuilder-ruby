@@ -52,20 +52,22 @@ module KrubyController
       end
 
       def watch_loop
-        loop while @running do
-          watch = Kubernetes::Watch.new(@api_client)
-          watch_path = watch_path_for(@gvk, @resource_version)
-          watch.connect(watch_path) do |event|
-            type = delta_type(event)
-            obj = event["object"]
-            @resource_version = obj.dig("metadata", "resourceVersion")
-            @store.add(type, obj)
-            @handlers.each { |h| h.handle(type, obj) }
+        while @running
+          begin
+            watch = Kubernetes::Watch.new(@api_client)
+            watch_path = watch_path_for(@gvk, @resource_version)
+            watch.connect(watch_path) do |event|
+              type = delta_type(event)
+              obj = event["object"]
+              @resource_version = obj.dig("metadata", "resourceVersion")
+              @store.add(type, obj)
+              @handlers.each { |h| h.handle(type, obj) }
+            end
+          rescue => e
+            KrubyController.logger.warn("Watch disconnected: #{e.message}")
+            sleep 1
+            retry if @running
           end
-        rescue => e
-          KrubyController.logger.warn("Watch disconnected: #{e.message}")
-          sleep 1
-          retry
         end
       end
 

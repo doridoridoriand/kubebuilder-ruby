@@ -3,6 +3,8 @@
 module KrubyController
   module Queue
     class WorkQueue
+      SENTINEL = Object.new.freeze
+
       def initialize
         @queue = Queue.new
         @known = Set.new
@@ -37,8 +39,15 @@ module KrubyController
         @queue.length
       end
 
-      def shutdown
+      def shutdown(num_workers = 1)
+        return if @closed
         @closed = true
+        # Unblock any threads blocked on pop
+        num_workers.times { @queue << SENTINEL }
+      end
+
+      def shutdown?
+        @closed
       end
     end
   end

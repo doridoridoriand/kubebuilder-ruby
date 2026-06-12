@@ -43,14 +43,12 @@ module KrubyController
 
     def start
       KrubyController.logger.info("Starting manager...")
-      @cache.start
-      @cache.wait_for_sync
 
       if @leader_elect
         @leader_elector = Election::LeaderElector.new(client: coordination_client, **@lease_opts)
-        @leader_elector.run { start_controllers }
+        @leader_elector.run { start_and_sync }
       else
-        start_controllers
+        start_and_sync
       end
 
       setup_signal_handlers
@@ -61,17 +59,24 @@ module KrubyController
       return if @stopped
       @stopped = true
       KrubyController.logger.info("Stopping manager...")
+      @stop_channel.send(:stopped)
       @controllers.each(&:stop)
       @cache.stop
       @leader_elector&.stop
+    end
+
+    private
+
+    def start_and_sync
+      start_controllers
+      @cache.start
+      @cache.wait_for_sync
     end
 
     def leader?
       return true unless @leader_elect
       @leader_elector&.leader || false
     end
-
-    private
 
     def start_controllers
       @controllers.each { |c| Thread.new { c.start } }

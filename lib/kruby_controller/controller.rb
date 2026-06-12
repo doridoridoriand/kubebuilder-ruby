@@ -31,7 +31,7 @@ module KrubyController
 
     def stop
       @running = false
-      @queue.shutdown
+      @queue.shutdown(@max_concurrent)
       @workers&.each(&:join)
     end
 
@@ -39,16 +39,22 @@ module KrubyController
 
     def worker_loop
       while @running
-        request = @queue.get
+        item = @queue.get
+        break if item.equal?(Queue::WorkQueue::SENTINEL)
+        request = item
+        result = nil
+        error = false
         begin
           result = @reconciler.reconcile(request)
-          handle_result(result, request)
         rescue => e
+          error = true
           KrubyController.logger.error("Reconcile error for #{request}: #{e.message}")
           @queue.add_after(request, 5)
         ensure
           @queue.done(request)
         end
+        return if @queue.shutdown?
+        handle_result(result, request) unless error
       end
     end
 

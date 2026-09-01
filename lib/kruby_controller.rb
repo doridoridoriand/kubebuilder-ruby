@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "kruby"
 require "logger"
 
 # KrubyController — Kubernetes Controller Framework for Ruby

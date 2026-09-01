@@ -6,7 +6,7 @@ module KrubyController
       SENTINEL = Object.new.freeze
 
       def initialize
-        @queue = Queue.new
+        @queue = ::Queue.new
         @known = Set.new
         @mutex = Mutex.new
         @closed = false

@@ -18,8 +18,12 @@ module KrubyController
 
     def start
       @running = true
-      informer = @cache.register(gvk: @for_gvk)
-      informer.add_handler(Handler::EnqueuedObject.new(queue: @queue))
+      @queue.reset if @queue.shutdown?
+      unless @handler_registered
+        informer = @cache.register(gvk: @for_gvk)
+        informer.add_handler(Handler::EnqueuedObject.new(queue: @queue))
+        @handler_registered = true
+      end
 
       @workers = (1..@max_concurrent).map do |i|
         Thread.new do

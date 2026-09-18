@@ -73,5 +73,19 @@ RSpec.describe KrubyController do
       queue.add(request)
       expect(queue.get).to eq(request)
     end
+
+    it "ignores adds after shutdown and accepts them again after reset" do
+      queue = KrubyController::Queue::WorkQueue.new
+      request = KrubyController::Request.new(namespace: "default", name: "foo")
+      queue.shutdown(1)
+      queue.get # consume the sentinel
+
+      queue.add(request)
+      expect(queue.len).to eq(0)
+
+      queue.reset
+      queue.add(request)
+      expect(queue.get).to eq(request)
+    end
   end
 end

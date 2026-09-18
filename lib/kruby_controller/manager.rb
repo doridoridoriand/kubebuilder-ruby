@@ -28,13 +28,17 @@ module KrubyController
     end
 
     def add(controller_or_reconciler, **options)
-      reconciler = if controller_or_reconciler.is_a?(Class) && controller_or_reconciler < Reconciler
-        controller_or_reconciler.new
-      else
-        controller_or_reconciler
-      end
-      controller = Controller.new(reconciler:, cache: @cache, **options)
+      reconciler = instantiate_reconciler(controller_or_reconciler)
+      gvk = resolve_gvk(options)
+      controller = Controller.new(
+        reconciler:,
+        cache: @cache,
+        for_gvk: gvk,
+        max_concurrent: options.fetch(:max_concurrent, 1),
+        name: options[:name]
+      )
       @controllers << controller
+      controller
     end
 
     def for(gvk)
@@ -66,6 +70,40 @@ module KrubyController
     end
 
     private
+
+    def instantiate_reconciler(controller_or_reconciler)
+      if controller_or_reconciler.is_a?(Class) && controller_or_reconciler < Reconciler
+        controller_or_reconciler.new
+      else
+        controller_or_reconciler
+      end
+    end
+
+    def resolve_gvk(options)
+      target = options[:for] || options[:for_gvk]
+      case target
+      when GVK
+        target
+      when Class
+        GVK.new(
+          group: target.group,
+          version: target.version,
+          kind: target.kind,
+          namespaced: target.respond_to?(:namespaced) ? target.namespaced : options.fetch(:namespaced, true)
+        )
+      when String, Symbol
+        group = options[:group]
+        version = options[:version]
+        unless group && version
+          raise ArgumentError,
+                "a bare Kind (#{target}) cannot be resolved; pass a GVK, a CRD class, " \
+                "or provide group:/version: options"
+        end
+        GVK.new(group:, version:, kind: target.to_s, namespaced: options.fetch(:namespaced, true))
+      else
+        raise ArgumentError, "for:/for_gvk: must be a KrubyController::GVK, a CRD class, or a Kind"
+      end
+    end
 
     def start_and_sync
       start_controllers
@@ -104,7 +142,7 @@ module KrubyController
     class Channel
       def initialize
         @mutex = Mutex.new
-        @cond = @mutex.new_cond
+        @cond = ConditionVariable.new
         @value = nil
       end
 

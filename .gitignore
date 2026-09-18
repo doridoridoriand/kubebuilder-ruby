@@ -16,4 +16,5 @@
 .DS_Store
 Thumbs.db
 .rspec_status
+spec/examples.txt
 .cache/

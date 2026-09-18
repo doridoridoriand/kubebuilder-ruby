@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module KrubyController
   module Cache
     class Informer
@@ -41,8 +43,14 @@ module KrubyController
 
       def populate
         list_path = list_path_for(@gvk)
-        resp = @api_client.get(list_path)
-        items = resp.dig("items") || []
+        request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
+        response = request.run
+        unless response.success?
+          raise KrubyController::Error,
+                "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
+        end
+        resp = JSON.parse(response.body)
+        items = resp["items"] || []
         items.each { |item| @store.add(Delta::ADDED, item) }
         @resource_version = resp.dig("metadata", "resourceVersion")
         @synced = true

@@ -49,6 +49,10 @@ module KrubyController
       def shutdown?
         @closed
       end
+
+      def reset
+        @closed = false
+      end
     end
   end
 end

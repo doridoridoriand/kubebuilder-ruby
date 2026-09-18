@@ -14,10 +14,14 @@ module KrubyController
         @handlers = handlers
         @resource_version = nil
         @running = false
+        @started = false
         @synced = false
       end
 
       def start
+        return if @started
+
+        @started = true
         @running = true
         @populate_thread = Thread.new { populate }
         @watch_thread = Thread.new { watch_loop }
@@ -31,6 +35,7 @@ module KrubyController
 
       def stop
         @running = false
+        @started = false
         @populate_thread&.join
         @watch_thread&.join
       end

@@ -5,7 +5,7 @@ RSpec.describe KrubyController do
     expect(KrubyController::VERSION).not_to be_nil
   end
 
-  describe Request do
+  describe KrubyController::Request do
     it "compares equal with same namespace/name" do
       r1 = KrubyController::Request.new(namespace: "default", name: "foo")
       r2 = KrubyController::Request.new(namespace: "default", name: "foo")
@@ -19,7 +19,7 @@ RSpec.describe KrubyController do
     end
   end
 
-  describe Result do
+  describe KrubyController::Result do
     it "creates Ok result" do
       expect(KrubyController::Result.ok).to be_a(KrubyController::Result::Ok)
     end
@@ -39,7 +39,7 @@ RSpec.describe KrubyController do
     end
   end
 
-  describe Reconciler do
+  describe KrubyController::Reconciler do
     it "raises NotImplementedError when reconcile is not implemented" do
       reconciler = KrubyController::Reconciler.new
       request = KrubyController::Request.new(namespace: "default", name: "test")

@@ -2,7 +2,7 @@
 
 module KrubyController
   class Controller
-    attr_reader :name, :reconciler
+    attr_reader :name, :reconciler, :for_gvk
 
     def initialize(reconciler:, cache:, for_gvk:, max_concurrent: 1, name: nil)
       @reconciler = reconciler

@@ -34,6 +34,7 @@ module KrubyController
   require_relative "kruby_controller/version"
   require_relative "kruby_controller/logger"
   require_relative "kruby_controller/gvk"
+  require_relative "kruby_controller/crd"
   require_relative "kruby_controller/request"
   require_relative "kruby_controller/result"
   require_relative "kruby_controller/reconciler"

@@ -49,6 +49,21 @@ module KrubyController
       def shutdown?
         @closed
       end
+
+      # Reopens the queue after shutdown, draining any shutdown sentinels that
+      # were not consumed by workers (e.g. a worker that returned mid-cycle
+      # after checking shutdown?). Real pending requests are preserved.
+      def reset
+        pending = []
+        loop do
+          item = @queue.pop(true)
+          pending << item unless item.equal?(SENTINEL)
+        rescue ThreadError
+          break
+        end
+        pending.each { |request| @queue << request }
+        @closed = false
+      end
     end
   end
 end

@@ -36,6 +36,7 @@ module KrubyController
       def stop
         @running = false
         @started = false
+        @synced = false
         @populate_thread&.join
         @watch_thread&.join
       end

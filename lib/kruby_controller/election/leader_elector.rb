@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "time"
+
 module KrubyController
   module Election
     # Lease-based leader election using the coordination.k8s.io/v1 Lease API.
@@ -60,7 +62,10 @@ module KrubyController
       def election_loop
         begin
           while @running
-            break unless try_acquire
+            unless try_acquire
+              sleep @retry_period
+              next
+            end
 
             @leader = true
             @renewal_running = true
@@ -93,14 +98,25 @@ module KrubyController
       end
 
       def renewal_loop
+        @last_successful_renewal = Time.now
         while @running && @renewal_running
-          if !renew_lease && lost_leadership?
+          if renew_lease
+            @last_successful_renewal = Time.now
+          elsif lost_leadership?
             KrubyController.logger.warn("LeaderElector: lost leadership")
+            @leader = false
+            break
+          elsif renewal_deadline_exceeded?
+            KrubyController.logger.warn("LeaderElector: renew deadline exceeded, stepping down")
             @leader = false
             break
           end
           sleep @retry_period
         end
+      end
+
+      def renewal_deadline_exceeded?
+        (Time.now - @last_successful_renewal) > @renew_deadline
       end
 
       def renew_lease
@@ -147,7 +163,7 @@ module KrubyController
         return true if spec.nil? || spec.holder_identity.nil? || spec.holder_identity.empty?
         return true if spec.holder_identity == @identity
 
-        last_seen = spec.renew_time || spec.acquire_time
+        last_seen = to_time(spec.renew_time) || to_time(spec.acquire_time)
         return false if last_seen.nil?
 
         (Time.now - last_seen) > (spec.lease_duration_seconds || @lease_duration)
@@ -156,26 +172,39 @@ module KrubyController
       def update_lease(lease)
         spec = lease.spec || Kubernetes::V1LeaseSpec.new
         now = Time.now.utc
+        spec.acquire_time = now if spec.holder_identity.nil? || spec.holder_identity != @identity
         spec.holder_identity = @identity
         spec.lease_duration_seconds = @lease_duration
-        spec.acquire_time ||= now
         spec.renew_time = now
         lease.spec = spec
         @client.replace_namespaced_lease(@lease_name, @lease_namespace, lease)
         true
       end
 
+      # Clears the holder using the resourceVersion read above as an atomic
+      # precondition, so a takeover between read and release fails with 409
+      # instead of destroying the new leader's lease.
       def release
         begin
           lease = read_lease
           if lease&.spec&.holder_identity == @identity
-            @client.delete_namespaced_lease(@lease_name, @lease_namespace)
+            lease.spec.holder_identity = nil
+            @client.replace_namespaced_lease(@lease_name, @lease_namespace, lease)
             KrubyController.logger.info("LeaderElector: released lease #{@lease_name}/#{@lease_namespace}")
           end
         rescue Kubernetes::ApiError => e
           KrubyController.logger.warn("LeaderElector: release failed: #{e.message}")
         end
         @leader = false
+      end
+
+      def to_time(value)
+        return nil if value.nil?
+        return value if value.is_a?(Time)
+
+        Time.parse(value.to_s)
+      rescue ArgumentError
+        nil
       end
     end
   end

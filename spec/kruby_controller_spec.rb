@@ -87,5 +87,16 @@ RSpec.describe KrubyController do
       queue.add(request)
       expect(queue.get).to eq(request)
     end
+
+    it "preserves pending requests and drains leftover sentinels on reset" do
+      queue = KrubyController::Queue::WorkQueue.new
+      request = KrubyController::Request.new(namespace: "default", name: "foo")
+      queue.add(request)
+      queue.shutdown(1) # a worker that exits mid-cycle leaves the sentinel in the queue
+
+      queue.reset
+
+      expect(queue.get).to eq(request)
+    end
   end
 end

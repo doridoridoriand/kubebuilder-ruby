@@ -101,23 +101,67 @@ RSpec.describe KrubyController::Election::LeaderElector do
   end
 
   describe "release" do
-    it "deletes the lease it holds when stopped" do
+    it "clears the holder of the lease it holds when stopped" do
       elector.run {}
       wait_until { elector.leader }
 
       elector.stop
 
-      expect(client).to have_received(:delete_namespaced_lease).with("test-lock", "kube-system")
+      expect(@lease.spec.holder_identity).to be_nil
+      expect(client).not_to have_received(:delete_namespaced_lease)
     end
 
-    it "does not delete a lease it does not hold" do
+    it "does not touch a lease it does not hold" do
       @lease = build_lease(holder: "other")
       elector.run {}
       sleep 0.2
 
       elector.stop
 
+      expect(@lease.spec.holder_identity).to eq("other")
       expect(client).not_to have_received(:delete_namespaced_lease)
+    end
+  end
+
+  describe "standby takeover" do
+    it "becomes leader once the current holder's lease goes stale" do
+      @lease = build_lease(holder: "other", renewed_at: Time.now)
+      elector.run {}
+      sleep 0.2
+      expect(elector.leader).to be false
+
+      @lease = build_lease(holder: "other", renewed_at: Time.now - 30)
+      wait_until { elector.leader }
+      expect(@lease.spec.holder_identity).to eq("me")
+
+      elector.stop
+    end
+  end
+
+  describe "renew deadline" do
+    it "steps down when renewals keep failing beyond renew_deadline" do
+      elector = described_class.new(
+        client:,
+        lease_name: "test-lock",
+        lease_namespace: "kube-system",
+        lease_duration: 15,
+        renew_deadline: 0.5,
+        retry_period: 0.1,
+        identity: "me",
+        on_stopped_leading: -> { @stopped = true }
+      )
+      @stopped = false
+
+      elector.run {}
+      wait_until { elector.leader }
+
+      allow(client).to receive(:read_namespaced_lease)
+        .and_raise(Kubernetes::ApiError.new(code: 500, message: "boom"))
+
+      wait_until { @stopped }
+      expect(elector.leader).to be false
+
+      elector.stop
     end
   end
 

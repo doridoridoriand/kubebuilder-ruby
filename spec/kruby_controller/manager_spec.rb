@@ -35,6 +35,22 @@ RSpec.describe KrubyController::Manager do
       )
     end
 
+    it "propagates a plural override into the GVK resource" do
+      klass = Class.new do
+        def self.group = "people.example.com"
+        def self.version = "v1"
+        def self.kind = "Person"
+        def self.namespaced = true
+        def self.plural = "people"
+      end
+
+      manager.add(GvkSpecCronTaskReconciler, for: klass)
+
+      expect(controllers.first.for_gvk).to eq(
+        KrubyController::GVK.new(group: "people.example.com", version: "v1", kind: "Person", resource: "people")
+      )
+    end
+
     it "resolves a Kind string with group/version options" do
       manager.add(GvkSpecCronTaskReconciler, for: "CronTask", group: "stable.example.com", version: "v1")
 

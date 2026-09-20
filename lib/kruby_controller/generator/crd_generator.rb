@@ -37,10 +37,29 @@ module KrubyController
       def group; @klass.group; end
       def version; @klass.version; end
       def kind; @klass.kind; end
-      def plural; kind.downcase + "s"; end
+      def plural
+        return @klass.plural if @klass.respond_to?(:plural) && @klass.plural
+
+        default_plural
+      end
+
+      def default_plural
+        word = kind.downcase
+        if word.end_with?("s", "x", "z", "ch", "sh")
+          "#{word}es"
+        elsif word.end_with?("y") && !%w[a e i o u].include?(word[-2])
+          "#{word[0..-2]}ies"
+        else
+          "#{word}s"
+        end
+      end
 
       def names_spec
-        { "plural" => plural, "singular" => kind.downcase, "kind" => kind }
+        names = { "plural" => plural, "singular" => kind.downcase, "kind" => kind }
+        if @klass.respond_to?(:short_names) && @klass.short_names
+          names["shortNames"] = @klass.short_names
+        end
+        names
       end
 
       def version_spec
@@ -63,20 +82,26 @@ module KrubyController
 
       def build_schema(attrs)
         return {} unless attrs
-        {
-          "type" => "object",
-          "properties" => attrs.transform_values { |a| attribute_to_schema(a) },
-          "required" => attrs.select { |_k, v| v.required? }.keys,
-        }
+        properties = {}
+        attrs.each { |name, attr| properties[name.to_s] = attribute_to_schema(attr) }
+        schema = { "type" => "object", "properties" => properties }
+        required = attrs.select { |_k, v| v.required? }.keys.map(&:to_s)
+        schema["required"] = required unless required.empty?
+        schema
       end
 
       def attribute_to_schema(attr)
-        schema = { "type" => TYPE_MAP[attr.type] || "string" }
+        schema = if attr.type == :object && attr.properties
+          build_schema(attr.properties)
+        else
+          { "type" => TYPE_MAP[attr.type] || "string" }.tap do |s|
+            s["items"] = attribute_to_schema(attr.items) if attr.respond_to?(:items) && attr.items
+          end
+        end
+
         schema["description"] = attr.description if attr.respond_to?(:description) && attr.description
         schema["default"] = attr.default if attr.respond_to?(:default) && !attr.default.nil?
         schema["enum"] = attr.enum if attr.respond_to?(:enum) && attr.enum
-        schema["properties"] = build_schema(attr.properties) if attr.respond_to?(:properties) && attr.properties
-        schema["items"] = attribute_to_schema(attr.items) if attr.respond_to?(:items) && attr.items
         schema
       end
     end

@@ -65,6 +65,7 @@ module KrubyController
   require_relative "kruby_controller/builder/controller_builder"
 
   # Helpers
+  require_relative "kruby_controller/kubernetes_object_client"
   require_relative "kruby_controller/finalizer/finalizer_manager"
   require_relative "kruby_controller/owner/owner_reference"
   require_relative "kruby_controller/status/status_updater"

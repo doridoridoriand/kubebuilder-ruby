@@ -97,6 +97,7 @@ module KrubyController
           group: target.group,
           version: target.version,
           kind: target.kind,
+          resource: target.respond_to?(:plural) ? target.plural : nil,
           namespaced: target.respond_to?(:namespaced) ? target.namespaced : options.fetch(:namespaced, true)
         )
       when String, Symbol

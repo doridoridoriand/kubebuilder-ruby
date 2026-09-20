@@ -22,6 +22,24 @@ class BuilderSpecReconciler < KrubyController::Reconciler
   end
 end
 
+class BuilderSpecSlowReconciler < KrubyController::Reconciler
+  attr_reader :count
+
+  def initialize
+    @count = 0
+    @mutex = Mutex.new
+  end
+
+  def reconcile(_request)
+    n = @mutex.synchronize do
+      @count += 1
+      @count
+    end
+    sleep 0.1 if n == 1 # widen the in-flight window
+    KrubyController::Result.ok
+  end
+end
+
 RSpec.describe KrubyController::Controller do
   let(:cache) { KrubyController::Cache::SharedCache.new }
   let(:reconciler) { BuilderSpecReconciler.new }
@@ -118,6 +136,47 @@ RSpec.describe KrubyController::Controller do
       handlers_for(BuilderSpecJobGVK).each { |h| h.handle(KrubyController::Cache::Delta::MODIFIED, job) }
 
       expect(wait_idle).to be_empty
+    end
+
+    it "reconciles the parent again when a child changes while the parent is in flight" do
+      slow = BuilderSpecSlowReconciler.new
+      slow_controller = described_class.new(
+        reconciler: slow,
+        cache: cache,
+        for_gvk: BuilderSpecCronTaskGVK,
+        owns: [BuilderSpecJobGVK]
+      )
+      slow_controller.start
+      begin
+        job = {
+          "metadata" => {
+            "namespace" => "default",
+            "name" => "job-3",
+            "ownerReferences" => [
+              {
+                "apiVersion" => "stable.example.com/v1",
+                "kind" => "CronTask",
+                "name" => "cron-a",
+                "uid" => "uid-a",
+                "controller" => true
+              }
+            ]
+          }
+        }
+        handlers_for(BuilderSpecJobGVK).each { |h| h.handle(KrubyController::Cache::Delta::MODIFIED, job) }
+
+        # First reconcile is slow (sleep 0.1). Fire a second child event
+        # while cron-a is still being reconciled.
+        sleep 0.05
+        handlers_for(BuilderSpecJobGVK).each { |h| h.handle(KrubyController::Cache::Delta::MODIFIED, job) }
+
+        deadline = Time.now + 3
+        sleep 0.05 while slow.count < 2 && Time.now < deadline
+
+        expect(slow.count).to be >= 2
+      ensure
+        slow_controller.stop
+      end
     end
   end
 

@@ -4,12 +4,15 @@ module KrubyController
   class Controller
     attr_reader :name, :reconciler, :for_gvk
 
-    def initialize(reconciler:, cache:, for_gvk:, max_concurrent: 1, name: nil)
+    def initialize(reconciler:, cache:, for_gvk:, max_concurrent: 1, name: nil, owns: [], watches: [], predicate: nil)
       @reconciler = reconciler
       @cache = cache
       @for_gvk = for_gvk
       @max_concurrent = max_concurrent
       @name = name || @for_gvk.kind.downcase
+      @owns = Array(owns)
+      @watches = Array(watches)
+      @predicate = predicate
       @queue = Queue::WorkQueue.new
       @running = false
       @reconciler.cache = cache
@@ -21,7 +24,21 @@ module KrubyController
       @queue.reset if @queue.shutdown?
       unless @handler_registered
         informer = @cache.register(gvk: @for_gvk)
-        informer.add_handler(Handler::EnqueuedObject.new(queue: @queue))
+        base = Handler::EnqueuedObject.new(queue: @queue)
+        informer.add_handler(@predicate ? Handler::Predicated.new(handler: base, predicate: @predicate) : base)
+
+        @owns.each do |owner_gvk|
+          owns_informer = @cache.register(gvk: owner_gvk)
+          owns_informer.add_handler(Handler::EnqueuedOwner.new(queue: @queue, owner_gvk: @for_gvk))
+        end
+
+        @watches.each do |watch|
+          watch_informer = @cache.register(gvk: watch[:gvk])
+          handler = watch[:handler] || Handler::EnqueuedObject.new(queue: @queue)
+          handler = Handler::Predicated.new(handler: handler, predicate: watch[:predicate]) if watch[:predicate]
+          watch_informer.add_handler(handler)
+        end
+
         @handler_registered = true
       end
 

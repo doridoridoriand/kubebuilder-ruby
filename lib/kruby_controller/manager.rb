@@ -35,7 +35,10 @@ module KrubyController
         cache: @cache,
         for_gvk: gvk,
         max_concurrent: options.fetch(:max_concurrent, 1),
-        name: options[:name]
+        name: options[:name],
+        owns: options.fetch(:owns, []),
+        watches: options.fetch(:watches, []),
+        predicate: options[:predicate]
       )
       @controllers << controller
       controller

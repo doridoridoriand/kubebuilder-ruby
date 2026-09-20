@@ -222,4 +222,52 @@ RSpec.describe KrubyController::Builder::ControllerBuilder do
     )
     controller.stop
   end
+
+  context "with CRD classes as secondary targets (documented fluent form)" do
+    let(:job_class) do
+      Class.new do
+        include KrubyController::CRD
+        self.group = "batch"
+        self.version = "v1"
+        self.kind = "Job"
+      end
+    end
+    let(:configmap_class) do
+      Class.new do
+        include KrubyController::CRD
+        self.group = ""
+        self.version = "v1"
+        self.kind = "ConfigMap"
+      end
+    end
+
+    it "normalizes owned/watched CRD classes into GVKs before registration" do
+      controller = manager
+        .for(BuilderSpecCronTaskGVK)
+        .owns(job_class)
+        .watches(configmap_class, predicate: ->(o) { true })
+        .complete_with(reconciler)
+
+      owns = controller.instance_variable_get(:@owns)
+      watch_gvks = controller.instance_variable_get(:@watches).map { |w| w[:gvk] }
+
+      expect(owns).to eq([KrubyController::GVK.new(group: "batch", version: "v1", kind: "Job", resource: "jobs")])
+      expect(watch_gvks).to eq(
+        [KrubyController::GVK.new(group: "", version: "v1", kind: "ConfigMap", resource: "configmaps")]
+      )
+      owns.each { |gvk| expect(gvk).to respond_to(:resource) }
+      watch_gvks.each { |gvk| expect(gvk).to respond_to(:resource) }
+    end
+
+    it "registers informers keyed by the normalized GVKs" do
+      controller = manager
+        .for(BuilderSpecCronTaskGVK)
+        .owns(job_class)
+        .complete_with(reconciler)
+
+      controller.start
+      expect(informers.keys).to contain_exactly(BuilderSpecCronTaskGVK.to_s, "batch/v1, Kind=Job")
+      controller.stop
+    end
+  end
 end

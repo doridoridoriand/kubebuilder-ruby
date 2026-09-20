@@ -29,7 +29,9 @@ module KrubyController
 
         @owns.each do |owner_gvk|
           owns_informer = @cache.register(gvk: owner_gvk)
-          owns_informer.add_handler(Handler::EnqueuedOwner.new(queue: @queue, owner_gvk: @for_gvk))
+          owns_informer.add_handler(
+            Handler::EnqueuedOwner.new(queue: @queue, owner_gvk: @for_gvk, owner_namespaced: @for_gvk.namespaced?)
+          )
         end
 
         @watches.each do |watch|

@@ -75,4 +75,37 @@ RSpec.describe KrubyController::Handler::EnqueuedOwner do
     handler.handle(KrubyController::Cache::Delta::ADDED, { "metadata" => { "namespace" => "d", "name" => "n" } })
     expect(queued).to be_empty
   end
+
+  context "with a cluster-scoped owner" do
+    let(:policy_gvk) { KrubyController::GVK.new(group: "policy.example.com", version: "v1", kind: "Policy", namespaced: false) }
+    let(:handler) { described_class.new(queue: queue, owner_gvk: policy_gvk, owner_namespaced: false) }
+
+    it "enqueues the owner under the empty namespace, not the child's" do
+      namespaced_child = {
+        "metadata" => {
+          "namespace" => "default",
+          "name" => "child-1",
+          "ownerReferences" => [
+            {
+              "apiVersion" => "policy.example.com/v1",
+              "kind" => "Policy",
+              "name" => "cluster-pol",
+              "controller" => true
+            }
+          ]
+        }
+      }
+
+      handler.handle(KrubyController::Cache::Delta::ADDED, namespaced_child)
+      expect(queued).to eq([KrubyController::Request.new(namespace: "", name: "cluster-pol")])
+    end
+  end
+
+  context "with the default (namespaced) owner" do
+    it "still copies the child namespace" do
+      default_handler = described_class.new(queue: queue, owner_gvk: parent_gvk)
+      default_handler.handle(KrubyController::Cache::Delta::ADDED, job)
+      expect(queued).to eq([KrubyController::Request.new(namespace: "default", name: "cron-a")])
+    end
+  end
 end

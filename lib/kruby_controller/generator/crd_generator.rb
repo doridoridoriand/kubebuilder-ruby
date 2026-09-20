@@ -91,13 +91,17 @@ module KrubyController
       end
 
       def attribute_to_schema(attr)
-        return build_schema(attr.properties) if attr.type == :object && attr.properties
+        schema = if attr.type == :object && attr.properties
+          build_schema(attr.properties)
+        else
+          { "type" => TYPE_MAP[attr.type] || "string" }.tap do |s|
+            s["items"] = attribute_to_schema(attr.items) if attr.respond_to?(:items) && attr.items
+          end
+        end
 
-        schema = { "type" => TYPE_MAP[attr.type] || "string" }
         schema["description"] = attr.description if attr.respond_to?(:description) && attr.description
         schema["default"] = attr.default if attr.respond_to?(:default) && !attr.default.nil?
         schema["enum"] = attr.enum if attr.respond_to?(:enum) && attr.enum
-        schema["items"] = attribute_to_schema(attr.items) if attr.respond_to?(:items) && attr.items
         schema
       end
     end

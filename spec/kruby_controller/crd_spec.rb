@@ -161,6 +161,24 @@ RSpec.describe KrubyController::CRD do
       expect(described_class.new(klass).generate["metadata"]["name"]).to eq("boxes.example.com")
     end
 
+    it "preserves outer metadata on object attributes with properties" do
+      klass = Class.new do
+        include KrubyController::CRD
+        self.group = "example.com"
+        self.kind = "Widget"
+        attribute :notification, type: :object, description: "通知先", properties: {
+          channel: { type: :string },
+        }
+      end
+
+      properties = described_class.new(klass).generate["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]
+      notification = properties["spec"]["properties"]["notification"]
+
+      expect(notification["type"]).to eq("object")
+      expect(notification["description"]).to eq("通知先")
+      expect(notification["properties"]).to eq("channel" => { "type" => "string" })
+    end
+
     it "produces YAML matching the generated structure" do
       yaml = described_class.new(CrdSpecCronTask).generate_yaml
 

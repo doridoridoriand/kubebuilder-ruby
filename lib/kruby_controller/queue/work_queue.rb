@@ -2,22 +2,38 @@
 
 module KrubyController
   module Queue
+    # Deduplicating work queue with an in-flight dirty flag
+    # (controller-runtime semantics).
+    #
+    # A key is "present" while it is queued (`@queued`) or in flight
+    # (`@processing`). `add` is a no-op for a key that is already present,
+    # except when the key is in flight: then it is recorded in `@dirty`
+    # instead of enqueued. When the worker calls `done`, a dirty key is
+    # re-queued so the reconciler runs once more for the latest state.
+    # Without this, an event for a key that is currently being reconciled
+    # would be dropped and never re-triggered.
     class WorkQueue
       SENTINEL = Object.new.freeze
 
       def initialize
         @queue = ::Queue.new
-        @known = Set.new
+        @queued = Set.new
+        @processing = Set.new
+        @dirty = Set.new
         @mutex = Mutex.new
         @closed = false
       end
 
       def add(request)
         return if @closed
-        key = request.namespaced_name.to_s
         @mutex.synchronize do
-          return if @known.include?(key)
-          @known.add(key)
+          key = request.namespaced_name.to_s
+          if @processing.include?(key)
+            @dirty.add(key)
+            return
+          end
+          return if @queued.include?(key)
+          @queued.add(key)
           @queue << request
         end
       end
@@ -27,12 +43,30 @@ module KrubyController
       end
 
       def get
-        @queue.pop
+        request = @queue.pop
+        return request if request.equal?(SENTINEL)
+
+        @mutex.synchronize do
+          key = request.namespaced_name.to_s
+          @queued.delete(key)
+          @processing.add(key)
+        end
+        request
       end
 
       def done(request)
-        key = request.namespaced_name.to_s
-        @mutex.synchronize { @known.delete(key) }
+        return if request.equal?(SENTINEL)
+        @mutex.synchronize do
+          key = request.namespaced_name.to_s
+          @processing.delete(key)
+          if @dirty.include?(key)
+            @dirty.delete(key)
+            @queued.add(key)
+            @queue << request
+          else
+            @queued.delete(key)
+          end
+        end
       end
 
       def len
@@ -61,7 +95,14 @@ module KrubyController
         rescue ThreadError
           break
         end
-        pending.each { |request| @queue << request }
+        @mutex.synchronize do
+          pending.each do |request|
+            @queue << request
+            @queued.add(request.namespaced_name.to_s)
+          end
+          @processing.clear
+          @dirty.clear
+        end
         @closed = false
       end
     end

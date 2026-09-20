@@ -54,10 +54,20 @@ module KrubyController
         request
       end
 
+      # Marks a request as completed. Only requests currently in flight
+      # (`@processing`) are considered: a key that is in flight and dirty is
+      # re-queued so the reconciler runs once more; a key that is in flight
+      # and not dirty is simply removed. Completions for keys that are not in
+      # flight (e.g. a duplicate `done` after a dirty requeue, where the
+      # re-queued copy is still pending or already handed to a worker) are
+      # ignored, keeping `done` idempotent and preventing duplicate
+      # enqueues.
       def done(request)
         return if request.equal?(SENTINEL)
         @mutex.synchronize do
           key = request.namespaced_name.to_s
+          next unless @processing.include?(key)
+
           @processing.delete(key)
           if @dirty.include?(key)
             @dirty.delete(key)

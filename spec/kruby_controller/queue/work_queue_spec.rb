@@ -57,6 +57,22 @@ RSpec.describe KrubyController::Queue::WorkQueue do
       expect(queue.len).to eq(1)
     end
 
+    it "ignores a duplicate done for a key that is no longer in flight (idempotent)" do
+      queue.add(req_a)
+      in_flight = queue.get
+      queue.add(req_a) # in flight -> dirty
+      queue.done(in_flight) # re-queued, in_flight no longer @processing
+
+      queue.done(in_flight) # duplicate done: key not processing -> ignored, no set mutation
+
+      # re-add must still dedupe (key is pending), not create a duplicate
+      queue.add(req_a)
+      expect(queue.len).to eq(1)
+      expect(queue.get).to eq(req_a)
+      queue.done(req_a)
+      expect(queue.len).to eq(0)
+    end
+
     it "does not lose a distinct key added while another key is in flight" do
       queue.add(req_a)
       queue.get

@@ -41,7 +41,7 @@ manager.start
 
 ## ヘルパー (Finalizer / Status)
 
-`FinalizerManager` / `StatusUpdater` は、`update` (オブジェクト全体の PUT) と `patch_status` (`/status` サブレソースの PATCH) を提供する client を必要とします。kruby の `CustomObjectsApi` にはこれらが存在しないため、本フレームワークの `KrubyController::KubernetesObjectClient` を client として渡します:
+`FinalizerManager` / `StatusUpdater` は、`update` (オブジェクト全体の PUT) と `patch_status` (`/status` サブリソースの PATCH) を提供する client を必要とします。kruby の `CustomObjectsApi` にはこれらが存在しないため、本フレームワークの `KrubyController::KubernetesObjectClient` を client として渡します:
 
 ```ruby
 config = Kubernetes::Configuration.default_config

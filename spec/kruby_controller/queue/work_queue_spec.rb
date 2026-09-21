@@ -34,8 +34,9 @@ RSpec.describe KrubyController::Queue::WorkQueue do
 
       queue.done(in_flight)
       expect(queue.len).to eq(1)
-      expect(queue.get).to eq(req_a)
-      queue.done(req_a)
+      requeued = queue.get # a fresh copy, not the in-flight object
+      expect(requeued).to eq(req_a)
+      queue.done(requeued)
       expect(queue.len).to eq(0)
     end
 
@@ -61,16 +62,34 @@ RSpec.describe KrubyController::Queue::WorkQueue do
       queue.add(req_a)
       in_flight = queue.get
       queue.add(req_a) # in flight -> dirty
-      queue.done(in_flight) # re-queued, in_flight no longer @processing
+      queue.done(in_flight) # re-queued as a fresh copy, in_flight no longer in flight
 
-      queue.done(in_flight) # duplicate done: key not processing -> ignored, no set mutation
+      queue.done(in_flight) # duplicate done: not the in-flight object -> ignored
 
       # re-add must still dedupe (key is pending), not create a duplicate
       queue.add(req_a)
       expect(queue.len).to eq(1)
-      expect(queue.get).to eq(req_a)
-      queue.done(req_a)
+      requeued = queue.get
+      expect(requeued).to eq(req_a)
+      queue.done(requeued)
       expect(queue.len).to eq(0)
+    end
+
+    it "ignores a stale done for an older copy after the key was re-queued to another worker" do
+      queue.add(req_a)
+      copy1 = queue.get
+      queue.add(req_a) # in flight -> dirty
+      queue.done(copy1) # re-queued with a fresh copy
+      copy2 = queue.get # a (second) worker now owns the key
+      queue.done(copy1) # stale completion for the old copy
+
+      # copy2 must still be in flight: an event for the key is recorded as
+      # dirty, not enqueued as a second copy
+      queue.add(req_a)
+      expect(queue.len).to eq(0)
+
+      queue.done(copy2) # dirty -> re-queued exactly once
+      expect(queue.len).to eq(1)
     end
 
     it "does not lose a distinct key added while another key is in flight" do

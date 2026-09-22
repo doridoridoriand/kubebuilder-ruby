@@ -35,7 +35,10 @@ module KrubyController
         cache: @cache,
         for_gvk: gvk,
         max_concurrent: options.fetch(:max_concurrent, 1),
-        name: options[:name]
+        name: options[:name],
+        owns: Array(options.fetch(:owns, [])).map { |target| resolve_target(target, options) },
+        watches: Array(options.fetch(:watches, [])).map { |w| w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w },
+        predicate: options[:predicate]
       )
       @controllers << controller
       controller
@@ -88,7 +91,10 @@ module KrubyController
     end
 
     def resolve_gvk(options)
-      target = options[:for] || options[:for_gvk]
+      resolve_target(options[:for] || options[:for_gvk], options)
+    end
+
+    def resolve_target(target, options = {})
       case target
       when GVK
         target
@@ -110,7 +116,7 @@ module KrubyController
         end
         GVK.new(group:, version:, kind: target.to_s, namespaced: options.fetch(:namespaced, true))
       else
-        raise ArgumentError, "for:/for_gvk: must be a KrubyController::GVK, a CRD class, or a Kind"
+        raise ArgumentError, "for:/for_gvk:/owns:/watches: must be a KrubyController::GVK, a CRD class, or a Kind"
       end
     end
 

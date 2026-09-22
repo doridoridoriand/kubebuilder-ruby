@@ -27,7 +27,10 @@ module KrubyController
       SENTINEL = Object.new.freeze
 
       def initialize
-        @queue = []
+        # Thread::Queue gives us O(1) FIFO push/pop. Its operations are
+        # performed while @mutex is held so that popping an item and moving
+        # its key from pending to in flight remain one atomic transition.
+        @queue = ::Queue.new
         @pending_keys = Set.new
         @in_flight = {}
         @dirty = Set.new
@@ -66,7 +69,7 @@ module KrubyController
               next
             end
 
-            item = @queue.shift
+            item = @queue.pop(true)
             return item if item.equal?(SENTINEL)
 
             key = item.namespaced_name.to_s
@@ -124,8 +127,16 @@ module KrubyController
       # and discarding leftover shutdown sentinels.
       def reset
         @mutex.synchronize do
-          pending = @queue.reject { |item| item.equal?(SENTINEL) }
-          @queue = pending
+          pending = []
+          loop do
+            item = @queue.pop(true)
+            pending << item unless item.equal?(SENTINEL)
+          rescue ThreadError
+            break
+          end
+
+          @queue = ::Queue.new
+          pending.each { |item| @queue << item }
           @pending_keys = Set.new(pending.map { |item| item.namespaced_name.to_s })
           @in_flight = {}
           @dirty = Set.new

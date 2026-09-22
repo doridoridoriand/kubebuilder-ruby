@@ -51,6 +51,7 @@ module KrubyController
   # Handlers
   require_relative "kruby_controller/handler/enqueued_object"
   require_relative "kruby_controller/handler/enqueued_owner"
+  require_relative "kruby_controller/handler/predicated"
 
   # Controller
   require_relative "kruby_controller/controller"

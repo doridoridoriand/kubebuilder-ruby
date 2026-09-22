@@ -38,7 +38,14 @@ module KrubyController
       end
 
       def complete_with(reconciler)
-        @manager.add(reconciler, for_gvk: @for_gvk, max_concurrent: @max_concurrent)
+        @manager.add(
+          reconciler,
+          for_gvk: @for_gvk,
+          max_concurrent: @max_concurrent,
+          owns: @owns,
+          watches: @watches,
+          predicate: @predicate
+        )
       end
     end
   end

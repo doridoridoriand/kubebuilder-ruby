@@ -22,21 +22,59 @@ class BuilderSpecReconciler < KrubyController::Reconciler
   end
 end
 
-class BuilderSpecSlowReconciler < KrubyController::Reconciler
-  attr_reader :count
-
+class BuilderSpecBlockingReconciler < KrubyController::Reconciler
   def initialize
     @count = 0
     @mutex = Mutex.new
+    @condition = ConditionVariable.new
+    @first_reconcile_started = false
+    @release_first_reconcile = false
   end
 
   def reconcile(_request)
-    n = @mutex.synchronize do
+    first_reconcile = @mutex.synchronize do
       @count += 1
-      @count
+      @first_reconcile_started = true if @count == 1
+      @condition.broadcast
+      @count == 1
     end
-    sleep 0.1 if n == 1 # widen the in-flight window
+
+    return KrubyController::Result.ok unless first_reconcile
+
+    @mutex.synchronize do
+      @condition.wait(@mutex) until @release_first_reconcile
+    end
     KrubyController::Result.ok
+  end
+
+  def wait_until_first_reconcile_starts(timeout: 2)
+    wait_until(timeout) { @first_reconcile_started }
+  end
+
+  def wait_until_count(count, timeout: 2)
+    wait_until(timeout) { @count >= count }
+  end
+
+  def release_first_reconcile
+    @mutex.synchronize do
+      @release_first_reconcile = true
+      @condition.broadcast
+    end
+  end
+
+  private
+
+  def wait_until(timeout)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    @mutex.synchronize do
+      until yield
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        return false if remaining <= 0
+
+        @condition.wait(@mutex, remaining)
+      end
+      true
+    end
   end
 end
 
@@ -139,14 +177,14 @@ RSpec.describe KrubyController::Controller do
     end
 
     it "reconciles the parent again when a child changes while the parent is in flight" do
-      slow = BuilderSpecSlowReconciler.new
-      slow_controller = described_class.new(
-        reconciler: slow,
+      blocking = BuilderSpecBlockingReconciler.new
+      blocking_controller = described_class.new(
+        reconciler: blocking,
         cache: cache,
         for_gvk: BuilderSpecCronTaskGVK,
         owns: [BuilderSpecJobGVK]
       )
-      slow_controller.start
+      blocking_controller.start
       begin
         job = {
           "metadata" => {
@@ -165,17 +203,16 @@ RSpec.describe KrubyController::Controller do
         }
         handlers_for(BuilderSpecJobGVK).each { |h| h.handle(KrubyController::Cache::Delta::MODIFIED, job) }
 
-        # First reconcile is slow (sleep 0.1). Fire a second child event
-        # while cron-a is still being reconciled.
-        sleep 0.05
+        # The first reconcile explicitly blocks, establishing that the
+        # second event is received while its parent is in flight.
+        expect(blocking.wait_until_first_reconcile_starts).to be(true)
         handlers_for(BuilderSpecJobGVK).each { |h| h.handle(KrubyController::Cache::Delta::MODIFIED, job) }
+        blocking.release_first_reconcile
 
-        deadline = Time.now + 3
-        sleep 0.05 while slow.count < 2 && Time.now < deadline
-
-        expect(slow.count).to be >= 2
+        expect(blocking.wait_until_count(2)).to be(true)
       ensure
-        slow_controller.stop
+        blocking.release_first_reconcile
+        blocking_controller.stop
       end
     end
   end

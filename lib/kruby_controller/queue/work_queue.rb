@@ -26,7 +26,8 @@ module KrubyController
     class WorkQueue
       SENTINEL = Object.new.freeze
 
-      def initialize
+      def initialize(rate_limiter: nil)
+        @rate_limiter = rate_limiter
         # Thread::Queue gives us O(1) FIFO push/pop. Its operations are
         # performed while @mutex is held so that popping an item and moving
         # its key from pending to in flight remain one atomic transition.
@@ -55,7 +56,26 @@ module KrubyController
       end
 
       def add_after(request, seconds)
-        Thread.new { sleep seconds; add(request) }
+        Thread.new do
+          sleep seconds
+          add(request)
+        end
+      end
+
+      # Re-queues +request+ after a delay decided by the rate limiter
+      # (controller-runtime's AddRateLimited). Requires a queue built with a
+      # rate_limiter.
+      def add_rate_limited(request)
+        raise ArgumentError, "WorkQueue#add_rate_limited requires a rate_limiter" unless @rate_limiter
+
+        delay = @rate_limiter.backoff(request.namespaced_name.to_s)
+        add_after(request, delay)
+      end
+
+      # Clears the rate limiter state for +request+'s key (controller-runtime's
+      # Forget); a no-op when the queue has no rate limiter.
+      def forget(request)
+        @rate_limiter&.forget(request.namespaced_name.to_s)
       end
 
       # Blocks until an item is available, atomically dequeueing it and
@@ -65,6 +85,7 @@ module KrubyController
           loop do
             if @queue.empty?
               return SENTINEL if @closed
+
               @cond.wait(@mutex)
               next
             end

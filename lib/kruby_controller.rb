@@ -40,6 +40,7 @@ module KrubyController
   require_relative "kruby_controller/reconciler"
 
   # Queue
+  require_relative "kruby_controller/queue/rate_limiter"
   require_relative "kruby_controller/queue/work_queue"
 
   # Cache

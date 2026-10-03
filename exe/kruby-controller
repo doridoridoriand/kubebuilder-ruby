@@ -5,18 +5,27 @@ require "kruby-controller"
 
 command = ARGV.shift
 
-case command
-when "init"
-  KrubyController::CLI::InitCommand.new(ARGV).run
-when "create"
-  case ARGV.shift
-  when "api"
-    KrubyController::CLI::CreateApiCommand.new(ARGV).run
+begin
+  case command
+  when "init"
+    KrubyController::CLI::InitCommand.new(ARGV).run
+  when "create"
+    case ARGV.shift
+    when "api"
+      KrubyController::CLI::CreateApiCommand.new(ARGV).run
+    else
+      warn "Unknown create subcommand: #{ARGV.first.inspect}"
+      warn "Usage: kruby-controller create api --group <G> --kind <K>"
+      exit 1
+    end
+  when nil, "-h", "--help"
+    puts "Usage: kruby-controller {init|create api}"
   else
-    puts "Unknown create subcommand: #{ARGV.first}"
+    warn "Unknown command: #{command.inspect}"
+    warn "Usage: kruby-controller {init|create api}"
     exit 1
   end
-else
-  puts "Usage: kruby-controller {init|create api}"
+rescue KrubyController::CLI::UsageError => e
+  warn e.message
   exit 1
 end

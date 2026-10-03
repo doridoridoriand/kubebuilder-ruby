@@ -75,6 +75,7 @@ module KrubyController
   require_relative "kruby_controller/generator/crd_generator"
 
   # CLI
+  require_relative "kruby_controller/cli/flag_parser"
   require_relative "kruby_controller/cli/init_command"
   require_relative "kruby_controller/cli/create_api_command"
 

@@ -1,0 +1,15 @@
+AllCops:
+  TargetRubyVersion: 3.3
+  NewCops: disable
+  SuggestExtensions: false
+  Exclude:
+    - "vendor/**/*"
+
+Style/StringLiterals:
+  EnforcedStyle: double_quotes
+
+Style/Documentation:
+  Enabled: false
+
+Metrics:
+  Enabled: false

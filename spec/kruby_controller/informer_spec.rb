@@ -2,6 +2,19 @@
 
 InformerGVK = Struct.new(:group, :version, :kind, :resource)
 
+class InformerSpecEventRecorder
+  attr_reader :events
+
+  def initialize
+    @events = []
+    @mutex = Mutex.new
+  end
+
+  def handle(type, obj)
+    @mutex.synchronize { @events << [type, obj] }
+  end
+end
+
 RSpec.describe KrubyController::Cache::Informer do
   let(:gvk) { InformerGVK.new("stable.example.com", "v1", "CronTask", "crontasks") }
   let(:store) { KrubyController::Cache::Store.new }
@@ -73,6 +86,110 @@ RSpec.describe KrubyController::Cache::Informer do
 
     it "uses /apis for group-scoped resources" do
       expect(informer.send(:list_path_for, gvk)).to eq("/apis/stable.example.com/v1/crontasks")
+    end
+  end
+
+  describe "watch relist (stale watch recovery)" do
+    let(:recorder) { InformerSpecEventRecorder.new }
+    let(:informer) { described_class.new(gvk: gvk, store: store, api_client: api_client) }
+    let(:added) { KrubyController::Cache::Delta::ADDED }
+    let(:deleted) { KrubyController::Cache::Delta::DELETED }
+
+    def item(name, rev, namespace: "default")
+      { "metadata" => { "namespace" => namespace, "name" => name, "resourceVersion" => rev } }
+    end
+
+    def list_response(items, rev)
+      double("response", success?: true, code: 200, status_message: "OK",
+                         body: { "items" => items, "metadata" => { "resourceVersion" => rev } }.to_json)
+    end
+
+    def stub_list(responses)
+      requests = responses.map { |resp| double("request", run: resp) }
+      allow(api_client).to receive(:build_request).and_return(*requests, requests.last)
+    end
+
+    def stub_watch(&behavior)
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      paths = []
+      paths_mutex = Mutex.new
+      allow(fake_watch).to receive(:connect) do |path, &block|
+        paths_mutex.synchronize { paths << path }
+        behavior.call(paths_mutex.synchronize { paths.size }, path, block)
+      end
+      paths
+    end
+
+    def wait_until(timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.05 until deadline <= Time.now || yield
+    end
+
+    after { informer.stop }
+
+    it "relists, syncs the store, and reconnects with the fresh resourceVersion after a 410 Gone" do
+      stub_list([
+                  list_response([item("a", "100"), item("b", "101")], "101"),
+                  list_response([item("a", "100"), item("c", "102")], "102")
+                ])
+      paths = stub_watch do |size, _path, _block|
+        raise KrubyController::Error, "410 Gone" if size == 1
+
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.add_handler(recorder)
+      informer.start
+      wait_until { store.get("default", "c") }
+
+      expect(store.get("default", "a")).to be_a(Hash)
+      expect(store.get("default", "c")).to be_a(Hash)
+      expect(store.get("default", "b")).to be_nil
+      expect(paths.size).to be >= 2
+      expect(paths.last).to include("resourceVersion=102")
+      expect(recorder.events).to include(
+        [added, hash_including("metadata" => hash_including("name" => "c"))]
+      )
+      expect(recorder.events).to include(
+        [deleted, hash_including("metadata" => hash_including("name" => "b"))]
+      )
+    end
+
+    it "relists when the watch stream closes cleanly" do
+      stub_list([list_response([item("a", "100")], "100")])
+      paths = stub_watch do |size, _path, _block|
+        if size == 1
+          # first watch closes cleanly (no error)
+        else
+          sleep 0.05
+          raise KrubyController::Error, "closed"
+        end
+      end
+
+      informer.start
+      wait_until { paths.size >= 2 }
+
+      expect(paths.size).to be >= 2
+      expect(store.get("default", "a")).to be_a(Hash)
+    end
+
+    it "retries a failed relist until the list succeeds" do
+      stub_list([
+                  list_response([item("a", "100")], "100"),
+                  double("response", success?: false, code: 500, status_message: "ISE", body: "{}"),
+                  list_response([item("a", "100"), item("d", "103")], "103")
+                ])
+      stub_watch do |_size, _path, _block|
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.start
+      wait_until { store.get("default", "d") }
+
+      expect(store.get("default", "d").dig("metadata", "resourceVersion")).to eq("103")
     end
   end
 end

@@ -37,8 +37,11 @@ module KrubyController
         max_concurrent: options.fetch(:max_concurrent, 1),
         name: options[:name],
         owns: Array(options.fetch(:owns, [])).map { |target| resolve_target(target, options) },
-        watches: Array(options.fetch(:watches, [])).map { |w| w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w },
-        predicate: options[:predicate]
+        watches: Array(options.fetch(:watches, [])).map do |w|
+          w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w
+        end,
+        predicate: options[:predicate],
+        rate_limiter: options[:rate_limiter]
       )
       @controllers << controller
       controller
@@ -68,6 +71,7 @@ module KrubyController
 
     def stop(timeout: 30)
       return if @stopped
+
       @stopped = true
       KrubyController.logger.info("Stopping manager...")
       @leader_elector&.stop
@@ -77,6 +81,7 @@ module KrubyController
 
     def leader?
       return true unless @leader_elect
+
       @leader_elector&.leader || false
     end
 
@@ -144,12 +149,12 @@ module KrubyController
     def coordination_client
       @coordination_client ||= begin
         config = if @kube_config
-          cfg = Kubernetes::Configuration.new
-          Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
-          cfg
-        else
-          Kubernetes::Configuration.default_config
-        end
+                   cfg = Kubernetes::Configuration.new
+                   Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
+                   cfg
+                 else
+                   Kubernetes::Configuration.default_config
+                 end
         Kubernetes::CoordinationV1Api.new(Kubernetes::ApiClient.new(config))
       end
     end

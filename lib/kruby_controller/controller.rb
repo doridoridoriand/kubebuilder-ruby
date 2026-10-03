@@ -2,9 +2,10 @@
 
 module KrubyController
   class Controller
-    attr_reader :name, :reconciler, :for_gvk
+    attr_reader :name, :reconciler, :for_gvk, :rate_limiter
 
-    def initialize(reconciler:, cache:, for_gvk:, max_concurrent: 1, name: nil, owns: [], watches: [], predicate: nil)
+    def initialize(reconciler:, cache:, for_gvk:, max_concurrent: 1, name: nil, owns: [], watches: [], predicate: nil,
+                   rate_limiter: nil)
       @reconciler = reconciler
       @cache = cache
       @for_gvk = for_gvk
@@ -13,7 +14,8 @@ module KrubyController
       @owns = Array(owns)
       @watches = Array(watches)
       @predicate = predicate
-      @queue = Queue::WorkQueue.new
+      @rate_limiter = rate_limiter || Queue::ExponentialBackoffRateLimiter.new
+      @queue = Queue::WorkQueue.new(rate_limiter: @rate_limiter)
       @running = false
       @reconciler.cache = cache
       @reconciler.logger = KrubyController.logger
@@ -64,30 +66,49 @@ module KrubyController
       while @running
         item = @queue.get
         break if item.equal?(Queue::WorkQueue::SENTINEL)
+
         request = item
+        key = request.namespaced_name.to_s
         result = nil
-        error = false
+        failure = false
         begin
           result = @reconciler.reconcile(request)
-        rescue => e
-          error = true
+        rescue StandardError => e
+          failure = true
           KrubyController.logger.error("Reconcile error for #{request}: #{e.message}")
-          @queue.add_after(request, 5)
         ensure
           @queue.done(request)
         end
         return if @queue.shutdown?
-        handle_result(result, request) unless error
+
+        if failure
+          requeue_with_backoff(request, key)
+        else
+          handle_result(result, request, key)
+        end
       end
     end
 
-    def handle_result(result, request)
-      case result
-      when Result::RetryAfter
-        @queue.add_after(request, result.after)
-      when Result::Requeue
-        @queue.add(request)
-      end
+    # Re-queues a failed reconcile after a per-key exponential backoff delay
+    # (5ms base, doubling per consecutive failure, capped at 5s by default).
+    def requeue_with_backoff(request, key)
+      delay = @rate_limiter.backoff(key)
+      KrubyController.logger.info(
+        "Requeueing #{request} in #{(delay * 1000).round} ms " \
+        "(consecutive failures: #{@rate_limiter.failures(key)})"
+      )
+      @queue.add_after(request, delay)
+    end
+
+    def handle_result(result, request, key)
+      # Explicit backoff requested by the reconciler; leaves the per-key
+      # failure count untouched.
+      return @queue.add_after(request, result.after) if result.is_a?(Result::RetryAfter)
+      # A result carrying an error is a failure: rate-limited requeue.
+      return @queue.add_after(request, @rate_limiter.backoff(key)) if result.respond_to?(:error) && result.error
+      return @queue.add(request) if result.is_a?(Result::Requeue)
+
+      @queue.forget(request)
     end
   end
 end

@@ -127,6 +127,56 @@ RSpec.describe KrubyController::Queue::WorkQueue do
     end
   end
 
+  describe "#add_rate_limited / #forget" do
+    def wait_until_len(work_queue, count, timeout: 2)
+      deadline = Time.now + timeout
+      sleep 0.01 while work_queue.len < count && Time.now < deadline
+    end
+
+    it "raises when the queue has no rate limiter" do
+      expect { queue.add_rate_limited(req_a) }.to raise_error(ArgumentError, /rate_limiter/)
+    end
+
+    it "enqueues after the limiter's delay" do
+      limiter = KrubyController::Queue::ExponentialBackoffRateLimiter.new(base: 0.05, max: 1)
+      q = described_class.new(rate_limiter: limiter)
+      q.add_rate_limited(req_a)
+
+      wait_until_len(q, 1)
+      expect(q.get).to eq(req_a)
+      expect(limiter.failures("default/a")).to eq(1)
+    end
+
+    it "increases the delay for repeated failures of the same key" do
+      limiter = KrubyController::Queue::ExponentialBackoffRateLimiter.new(base: 0.02, max: 1)
+      q = described_class.new(rate_limiter: limiter)
+
+      q.add_rate_limited(req_a)
+      wait_until_len(q, 1)
+      first = q.get
+      q.done(first)
+
+      start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      q.add_rate_limited(req_a) # second failure -> 2 * base
+      wait_until_len(q, 1)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - start
+
+      expect(elapsed).to be >= 0.03
+      second = q.get
+      expect(second).to eq(req_a)
+    end
+
+    it "forget clears the limiter state for the key" do
+      limiter = KrubyController::Queue::ExponentialBackoffRateLimiter.new(base: 1, max: 100)
+      q = described_class.new(rate_limiter: limiter)
+      limiter.backoff("default/a")
+
+      q.forget(req_a)
+
+      expect(limiter.failures("default/a")).to eq(0)
+    end
+  end
+
   describe "#shutdown / #reset" do
     it "stops accepting and unblocks workers with sentinels" do
       queue.shutdown(1)

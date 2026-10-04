@@ -16,8 +16,12 @@ module KrubyController
     # While leading, the lease is renewed every retry_period. When leadership
     # is lost (lease taken over by another identity), the renewal stops and
     # on_stopped_leading is invoked; the elector then keeps retrying.
+    #
+    # If the leading block raises, the error is recorded (see #leading_error),
+    # on_leading_error is invoked (if given), and the elector stops trying to
+    # acquire leadership -- a fatal startup failure should not loop forever.
     class LeaderElector
-      attr_reader :leader
+      attr_reader :leader, :leading_error
 
       def initialize(
         client:,
@@ -27,7 +31,8 @@ module KrubyController
         renew_deadline: 10,
         retry_period: 2,
         identity: nil,
-        on_stopped_leading: nil
+        on_stopped_leading: nil,
+        on_leading_error: nil
       )
         @client = client
         @lease_name = lease_name
@@ -37,7 +42,9 @@ module KrubyController
         @retry_period = retry_period
         @identity = identity || "#{Socket.gethostname}-#{Process.pid}"
         @on_stopped_leading = on_stopped_leading
+        @on_leading_error = on_leading_error
         @leader = false
+        @leading_error = nil
         @running = false
         @renewal_running = false
         @thread = nil
@@ -60,30 +67,35 @@ module KrubyController
       private
 
       def election_loop
-        begin
-          while @running
-            unless try_acquire
-              sleep @retry_period
-              next
-            end
+        while @running
+          unless try_acquire
+            sleep @retry_period
+            next
+          end
 
-            @leader = true
-            @renewal_running = true
-            renewal_thread = Thread.new { renewal_loop }
-            begin
-              @started_leading_block&.call
-            rescue => e
-              KrubyController.logger.error("LeaderElector: on_started_leading failed: #{e.message}")
-            end
-            renewal_thread.join
+          @leader = true
+          @renewal_running = true
+          renewal_thread = Thread.new { renewal_loop }
+          begin
+            @started_leading_block&.call
+          rescue StandardError => e
+            KrubyController.logger.error("LeaderElector: on_started_leading failed: #{e.message}")
+            @leading_error = e
+            @on_leading_error&.call
+            @running = false
             @renewal_running = false
             @leader = false
-            @on_stopped_leading&.call
-            sleep @retry_period
+            renewal_thread.join
+            break
           end
-        ensure
-          release
+          renewal_thread.join
+          @renewal_running = false
+          @leader = false
+          @on_stopped_leading&.call
+          sleep @retry_period
         end
+      ensure
+        release
       end
 
       def try_acquire

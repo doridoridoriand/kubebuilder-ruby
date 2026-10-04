@@ -56,9 +56,52 @@ RSpec.describe KrubyController::Cache::Informer do
         double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}")
       end
 
-      it "raises an error containing the HTTP status" do
-        expect { informer.send(:populate) }.to raise_error(StandardError, /list failed.*403/)
+      it "retries the list instead of raising, and stops when the informer is stopped" do
+        allow(informer).to receive(:sleep) # skip the backoff
+        informer.instance_variable_set(:@running, true) # as if started
+        thread = Thread.new { informer.send(:populate) }
+
+        sleep 0.2
         expect(informer.synced).to be false
+        expect(api_client).to have_received(:build_request).at_least(:twice)
+
+        informer.stop
+        thread.join
+        expect(thread).not_to be_alive
+      end
+    end
+
+    context "when list fails transiently then succeeds" do
+      let(:failed_request) do
+        double("request", run: double("response", success?: false, code: 500, status_message: "ISE", body: "{}"))
+      end
+      let(:ok_request) do
+        double(
+          "request",
+          run: double(
+            "response",
+            success?: true,
+            code: 200,
+            status_message: "OK",
+            body: {
+              "items" => [
+                { "metadata" => { "namespace" => "default", "name" => "a", "resourceVersion" => "100" } }
+              ],
+              "metadata" => { "resourceVersion" => "100" }
+            }.to_json
+          )
+        )
+      end
+
+      it "succeeds on a later attempt and syncs" do
+        allow(api_client).to receive(:build_request).and_return(failed_request, ok_request)
+        allow(informer).to receive(:sleep) # skip the backoff
+        informer.instance_variable_set(:@running, true) # as if started
+
+        informer.send(:populate)
+
+        expect(informer.synced).to be true
+        expect(store.get("default", "a")).to be_a(Hash)
       end
     end
   end

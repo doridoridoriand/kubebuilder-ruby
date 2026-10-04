@@ -47,22 +47,48 @@ module KrubyController
 
       private
 
+      POPULATE_INITIAL_BACKOFF = 1.0
+      POPULATE_MAX_BACKOFF = 30.0
+
+      # Repeatedly Lists the initial state until it succeeds (or the informer
+      # is stopped), so a transient API failure at startup does not leave the
+      # informer unsynced forever.
       def populate
-        list_path = list_path_for(@gvk)
-        request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
-        response = request.run
-        unless response.success?
-          raise KrubyController::Error,
-                "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
+        backoff = POPULATE_INITIAL_BACKOFF
+        loop do
+          list_path = list_path_for(@gvk)
+          request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
+          response = request.run
+          unless response.success?
+            raise KrubyController::Error,
+                  "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
+          end
+          resp = JSON.parse(response.body)
+          items = resp["items"] || []
+          items.each { |item| @store.add(Delta::ADDED, item) }
+          @resource_version = resp.dig("metadata", "resourceVersion")
+          @synced = true
+          return
+        rescue StandardError => e
+          KrubyController.logger.error(
+            "Informer populate failed for #{@gvk}: #{e.message}; retrying in #{backoff}s"
+          )
+          return unless @running
+
+          interruptible_sleep(backoff)
+          backoff = [backoff * 2, POPULATE_MAX_BACKOFF].min
         end
-        resp = JSON.parse(response.body)
-        items = resp["items"] || []
-        items.each { |item| @store.add(Delta::ADDED, item) }
-        @resource_version = resp.dig("metadata", "resourceVersion")
-        @synced = true
-      rescue => e
-        KrubyController.logger.error("Informer populate failed: #{e.message}")
-        raise
+      end
+
+      # Sleeps up to +seconds+, waking early when the informer is stopped so
+      # #stop (which joins this thread) stays responsive.
+      def interruptible_sleep(seconds)
+        slept = 0.0
+        while slept < seconds && @running
+          step = [0.5, seconds - slept].min
+          sleep step
+          slept += step
+        end
       end
 
       def watch_loop
@@ -77,7 +103,7 @@ module KrubyController
               @store.add(type, obj)
               @handlers.each { |h| h.handle(type, obj) }
             end
-          rescue => e
+          rescue StandardError => e
             KrubyController.logger.warn("Watch disconnected: #{e.message}")
             sleep 1
             retry if @running

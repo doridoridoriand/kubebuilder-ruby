@@ -12,6 +12,7 @@ module KrubyController
       def register(gvk:)
         @mutex.synchronize do
           return @informers[gvk.to_s] if @informers.key?(gvk.to_s)
+
           store = Store.new
           informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [])
           @informers[gvk.to_s] = informer
@@ -22,19 +23,29 @@ module KrubyController
       def get(gvk, namespace, name)
         informer = @informers[gvk.to_s]
         return nil unless informer
+
         informer.store.get(namespace, name)
       end
 
       def list(gvk, namespace: nil, label_selector: nil)
         informer = @informers[gvk.to_s]
         return [] unless informer
+
         results = informer.store.list(label_selector:)
         results = results.select { |o| ns_matches?(o, namespace) } if namespace
         results
       end
 
       def wait_for_sync(timeout: 30)
-        @informers.values.each { |i| i.wait_for_sync(timeout:) }
+        # No informers: vacuously synced.
+        deadline = Time.now + timeout
+        loop do
+          informers = @mutex.synchronize { @informers.values }
+          return true if informers.all?(&:synced)
+          return false if Time.now >= deadline
+
+          sleep 0.1
+        end
       end
 
       def start
@@ -50,12 +61,12 @@ module KrubyController
       def api_client
         @api_client ||= begin
           config = if @kube_config
-            cfg = Kubernetes::Configuration.new
-            Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
-            cfg
-          else
-            Kubernetes::Configuration.default_config
-          end
+                     cfg = Kubernetes::Configuration.new
+                     Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
+                     cfg
+                   else
+                     Kubernetes::Configuration.default_config
+                   end
           Kubernetes::ApiClient.new(config)
         end
       end

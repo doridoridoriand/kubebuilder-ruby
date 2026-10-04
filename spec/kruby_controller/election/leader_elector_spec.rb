@@ -28,11 +28,9 @@ RSpec.describe KrubyController::Election::LeaderElector do
   before do
     @lease = nil
     allow(client).to receive(:read_namespaced_lease) do
-      if @lease
-        @lease
-      else
-        raise Kubernetes::ApiError.new(code: 404, message: "Not Found")
-      end
+      raise Kubernetes::ApiError.new(code: 404, message: "Not Found") unless @lease
+
+      @lease
     end
     allow(client).to receive(:create_namespaced_lease) do |_namespace, body|
       @lease = body
@@ -187,6 +185,33 @@ RSpec.describe KrubyController::Election::LeaderElector do
       expect(elector.leader).to be false
 
       elector.stop
+    end
+  end
+
+  describe "leading block failure" do
+    it "records the error, invokes on_leading_error, releases the lease, and stops electing" do
+      @error_called = false
+      elector = described_class.new(
+        client:,
+        lease_name: "test-lock",
+        lease_namespace: "kube-system",
+        lease_duration: 15,
+        renew_deadline: 10,
+        retry_period: 0.1,
+        identity: "me",
+        on_leading_error: -> { @error_called = true }
+      )
+
+      elector.run { raise StandardError, "cache sync timed out" }
+
+      wait_until { elector.leading_error }
+
+      expect(elector.leading_error.message).to include("cache sync timed out")
+      expect(@error_called).to be true
+      expect(elector.leader).to be false
+
+      elector.stop
+      expect(@lease.spec.holder_identity).to be_nil # released on the way out
     end
   end
 end

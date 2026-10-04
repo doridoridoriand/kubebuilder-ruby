@@ -84,4 +84,57 @@ RSpec.describe KrubyController::Manager do
         .to raise_error(ArgumentError, /must be a KrubyController::GVK/)
     end
   end
+
+  describe "#start cache sync failure" do
+    let(:manager) { described_class.new(leader_elect: false, sync_timeout: 0.5) }
+
+    # manager.start installs SIGTERM/SIGINT traps; restore defaults after.
+    after do
+      Signal.trap("TERM", "DEFAULT")
+      Signal.trap("INT", "DEFAULT")
+    end
+
+    def fake_cache(synced)
+      double(
+        "cache",
+        start: true,
+        stop: true,
+        wait_for_sync: synced,
+        register: double("informer", add_handler: true)
+      )
+    end
+
+    it "stops components and raises when the cache does not sync in time" do
+      cache = fake_cache(false)
+      manager.instance_variable_set(:@cache, cache)
+      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
+
+      expect { manager.start }.to raise_error(/cache sync timed out/)
+      expect(cache).to have_received(:stop)
+    end
+
+    it "propagates the sync failure as the start error on the leader path" do
+      manager = described_class.new(leader_elect: true, sync_timeout: 0.5)
+      manager.instance_variable_set(:@cache, fake_cache(false))
+      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
+
+      fake_elector = double("elector", leading_error: nil)
+      on_leading_error = nil
+      allow(fake_elector).to receive(:run) do |&block|
+        begin
+          block.call
+        rescue StandardError => e
+          allow(fake_elector).to receive(:leading_error).and_return(e)
+          on_leading_error&.call
+        end
+        fake_elector
+      end
+      allow(KrubyController::Election::LeaderElector).to receive(:new) do |opts|
+        on_leading_error = opts[:on_leading_error]
+        fake_elector
+      end
+
+      expect { manager.start }.to raise_error(/cache sync timed out/)
+    end
+  end
 end

@@ -13,12 +13,14 @@ module KrubyController
       lease_duration: 15,
       renew_deadline: 10,
       retry_period: 2,
+      sync_timeout: 30,
       logger: nil
     )
       @kube_config = kube_config
       @namespace = namespace
       @leader_elect = leader_elect
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
+      @sync_timeout = sync_timeout
       @logger = logger
       @cache = Cache::SharedCache.new(kube_config:)
       @controllers = []
@@ -37,7 +39,9 @@ module KrubyController
         max_concurrent: options.fetch(:max_concurrent, 1),
         name: options[:name],
         owns: Array(options.fetch(:owns, [])).map { |target| resolve_target(target, options) },
-        watches: Array(options.fetch(:watches, [])).map { |w| w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w },
+        watches: Array(options.fetch(:watches, [])).map do |w|
+          w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w
+        end,
         predicate: options[:predicate]
       )
       @controllers << controller
@@ -55,6 +59,10 @@ module KrubyController
         @leader_elector = Election::LeaderElector.new(
           client: coordination_client,
           on_stopped_leading: -> { stop_components },
+          on_leading_error: lambda {
+            stop_components
+            @stop_channel.send(:stopped)
+          },
           **@lease_opts
         )
         @leader_elector.run { start_and_sync }
@@ -64,10 +72,12 @@ module KrubyController
 
       setup_signal_handlers
       @stop_channel.receive
+      raise @leader_elector.leading_error if @leader_elector&.leading_error
     end
 
     def stop(timeout: 30)
       return if @stopped
+
       @stopped = true
       KrubyController.logger.info("Stopping manager...")
       @leader_elector&.stop
@@ -77,6 +87,7 @@ module KrubyController
 
     def leader?
       return true unless @leader_elect
+
       @leader_elector&.leader || false
     end
 
@@ -123,7 +134,12 @@ module KrubyController
     def start_and_sync
       start_controllers
       @cache.start
-      @cache.wait_for_sync
+      return if @cache.wait_for_sync(timeout: @sync_timeout)
+
+      message = "cache sync timed out after #{@sync_timeout}s"
+      KrubyController.logger.error("Manager: #{message}; stopping")
+      stop_components
+      raise KrubyController::Error, message
     end
 
     def stop_components
@@ -144,12 +160,12 @@ module KrubyController
     def coordination_client
       @coordination_client ||= begin
         config = if @kube_config
-          cfg = Kubernetes::Configuration.new
-          Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
-          cfg
-        else
-          Kubernetes::Configuration.default_config
-        end
+                   cfg = Kubernetes::Configuration.new
+                   Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
+                   cfg
+                 else
+                   Kubernetes::Configuration.default_config
+                 end
         Kubernetes::CoordinationV1Api.new(Kubernetes::ApiClient.new(config))
       end
     end

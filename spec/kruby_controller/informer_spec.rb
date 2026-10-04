@@ -74,5 +74,32 @@ RSpec.describe KrubyController::Cache::Informer do
     it "uses /apis for group-scoped resources" do
       expect(informer.send(:list_path_for, gvk)).to eq("/apis/stable.example.com/v1/crontasks")
     end
+
+    it "uses the namespaced path for namespaced resources when a namespace is set" do
+      ns_informer = described_class.new(gvk: gvk, store: store, api_client: api_client, namespace: "team-a")
+      gvk_with_scope = KrubyController::GVK.new(
+        group: "stable.example.com", version: "v1", kind: "CronTask", resource: "crontasks"
+      )
+
+      expect(ns_informer.send(:list_path_for, gvk_with_scope))
+        .to eq("/apis/stable.example.com/v1/namespaces/team-a/crontasks")
+    end
+
+    it "uses the namespaced /api path for core resources when a namespace is set" do
+      ns_informer = described_class.new(gvk: gvk, store: store, api_client: api_client, namespace: "team-a")
+      core_gvk = KrubyController::GVK.new(group: "", version: "v1", kind: "ConfigMap", resource: "configmaps")
+
+      expect(ns_informer.send(:list_path_for, core_gvk)).to eq("/api/v1/namespaces/team-a/configmaps")
+    end
+
+    it "keeps cluster-scoped resources cluster-wide even when a namespace is set" do
+      ns_informer = described_class.new(gvk: gvk, store: store, api_client: api_client, namespace: "team-a")
+      cluster_gvk = KrubyController::GVK.new(
+        group: "stable.example.com", version: "v1", kind: "ClusterThing",
+        resource: "clusterthings", namespaced: false
+      )
+
+      expect(ns_informer.send(:list_path_for, cluster_gvk)).to eq("/apis/stable.example.com/v1/clusterthings")
+    end
   end
 end

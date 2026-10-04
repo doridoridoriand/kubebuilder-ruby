@@ -84,4 +84,15 @@ RSpec.describe KrubyController::Manager do
         .to raise_error(ArgumentError, /must be a KrubyController::GVK/)
     end
   end
+
+  describe "namespace option" do
+    it "propagates the namespace to registered informers" do
+      manager = described_class.new(namespace: "team-a")
+      gvk = KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask")
+
+      informer = manager.cache.register(gvk: gvk)
+
+      expect(informer.instance_variable_get(:@namespace)).to eq("team-a")
+    end
+  end
 end

@@ -142,7 +142,12 @@ RSpec.describe KrubyController::Cache::Informer do
 
       informer.add_handler(recorder)
       informer.start
-      wait_until { store.get("default", "c") }
+      # Waiting for the second connection guarantees the first relist fully
+      # completed: the store was replaced, the ADDED/DELETED diff events were
+      # emitted to handlers, and @resource_version advanced to 102. Waiting on
+      # the store alone would only prove `replace` ran, not that the events
+      # were delivered.
+      wait_until { paths.size >= 2 }
 
       expect(store.get("default", "a")).to be_a(Hash)
       expect(store.get("default", "c")).to be_a(Hash)
@@ -155,6 +160,38 @@ RSpec.describe KrubyController::Cache::Informer do
       expect(recorder.events).to include(
         [deleted, hash_including("metadata" => hash_including("name" => "b"))]
       )
+    end
+
+    it "delivers all relist events to surviving handlers even when one handler raises" do
+      raising = Class.new do
+        def handle(_type, _obj)
+          raise "handler boom"
+        end
+      end.new
+      recorder = InformerSpecEventRecorder.new
+
+      stub_list([
+                  list_response([item("a", "100"), item("b", "101")], "101"),
+                  list_response([item("a", "100"), item("c", "102")], "102")
+                ])
+      paths = stub_watch do |size, _path, _block|
+        raise KrubyController::Error, "410 Gone" if size == 1
+
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.add_handler(raising)
+      informer.add_handler(recorder)
+      informer.start
+      wait_until { paths.size >= 2 }
+
+      # The store snapshot is already committed by the first relist, so a
+      # retry would compare identical snapshots and emit nothing. The recorder
+      # must still receive every diff event despite the first handler raising.
+      names = recorder.events.map { |(_type, obj)| obj.dig("metadata", "name") }
+      expect(names).to include("c")
+      expect(names).to include("b")
     end
 
     it "relists when the watch stream closes cleanly" do

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "fileutils"
+require "yaml"
 require "kruby_controller/cli/flag_parser"
 
 module KrubyController
@@ -44,6 +45,11 @@ module KrubyController
         force = FlagParser.flag?(@args, "--force")
         FlagParser.check_known!(@args, ALLOWED_FLAGS)
 
+        unless FlagParser.dns_subdomain?(domain)
+          raise UsageError,
+                "invalid --domain #{domain.inspect}; must be a DNS subdomain (lowercase labels separated by '.')"
+        end
+
         unless SUPPORTED_LICENSES.include?(license)
           raise UsageError, "unsupported license #{license.inspect}; expected one of #{SUPPORTED_LICENSES.join(', ')}"
         end
@@ -61,12 +67,15 @@ module KrubyController
       private
 
       def resolve_target(repo)
-        return [File.basename(Dir.pwd), Dir.pwd] if repo.nil? || repo == "."
+        if repo.nil? || repo == "."
+          name = FlagParser.normalize_dns_label(File.basename(Dir.pwd))
+          raise UsageError, "cannot derive a valid project name from #{Dir.pwd}" if name.nil?
 
-        name = File.basename(File.expand_path(repo))
-        if name.empty? || name == "." || name == "/"
-          raise UsageError, "cannot derive a project name from --repo #{repo.inspect}"
+          return [name, Dir.pwd]
         end
+
+        name = FlagParser.normalize_dns_label(File.basename(File.expand_path(repo)))
+        raise UsageError, "cannot derive a valid project name from --repo #{repo.inspect}" if name.nil?
 
         [name, File.join(Dir.pwd, name)]
       end
@@ -165,11 +174,12 @@ module KrubyController
       end
 
       def project_yml
-        <<~YAML
-          domain: #{@domain}
-          repo: #{@repo || '.'}
-          license: #{@license}
-        YAML
+        YAML.dump(
+          "name" => @name,
+          "domain" => @domain,
+          "repo" => @repo || ".",
+          "license" => @license
+        )
       end
 
       def bin_manager
@@ -226,6 +236,21 @@ module KrubyController
           metadata:
             name: #{@name}-manager
             namespace: #{@name}
+          ---
+          # Bind the base manager ClusterRole (leader election) to the manager
+          # ServiceAccount so the deployment can acquire coordination leases.
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: #{@name}-manager-rolebinding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: #{@name}-manager-role
+          subjects:
+            - kind: ServiceAccount
+              name: #{@name}-manager
+              namespace: #{@name}
           ---
           apiVersion: apps/v1
           kind: Deployment

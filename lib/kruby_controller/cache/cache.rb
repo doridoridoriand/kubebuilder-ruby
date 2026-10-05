@@ -33,8 +33,21 @@ module KrubyController
         results
       end
 
+      # Waits until every informer is synced. If an informer exhausts its
+      # initial-List retry budget, the recorded cause is raised so Manager
+      # startup fails with the real error instead of hanging.
       def wait_for_sync(timeout: 30)
-        @informers.values.each { |i| i.wait_for_sync(timeout:) }
+        deadline = Time.now + timeout
+        loop do
+          informers = @mutex.synchronize { @informers.values }
+          failed = informers.find { |i| !i.synced && i.sync_error }
+          raise failed.sync_error if failed
+
+          return true if informers.all?(&:synced)
+          return false if Time.now >= deadline
+
+          sleep 0.1
+        end
       end
 
       def start

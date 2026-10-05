@@ -69,10 +69,43 @@ RSpec.describe KrubyController::Cache::Informer do
         double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}")
       end
 
-      it "raises an error containing the HTTP status" do
-        expect { informer.send(:populate) }.to raise_error(StandardError, /list failed.*403/)
+      it "records the sync error after exhausting retries instead of raising" do
+        allow(informer).to receive(:interruptible_sleep)
+        informer.instance_variable_set(:@running, true)
+
+        informer.send(:populate)
+
         expect(informer.synced).to be false
+        expect(informer.sync_error).to be_a(KrubyController::Error)
+        expect(informer.sync_error.message).to include("403")
+        expect(api_client).to have_received(:build_request).exactly(4).times
       end
+    end
+  end
+
+  describe "initial List failure lifecycle" do
+    let(:response) do
+      double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}")
+    end
+
+    it "records the sync error and does not wait forever for the watch" do
+      allow(api_client).to receive(:build_request).and_return(double("request", run: response))
+      allow(informer).to receive(:interruptible_sleep)
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      watch_started = false
+      allow(fake_watch).to receive(:connect) { watch_started = true }
+
+      informer.start
+      deadline = Time.now + 5
+      sleep 0.05 until informer.sync_error || Time.now >= deadline
+
+      expect(informer.synced).to be false
+      expect(informer.sync_error).to be_a(KrubyController::Error)
+      # The watch never started: it waits for the List, which failed.
+      expect(watch_started).to be false
+    ensure
+      informer.stop
     end
   end
 

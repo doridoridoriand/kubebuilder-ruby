@@ -5,7 +5,7 @@ require "json"
 module KrubyController
   module Cache
     class Informer
-      attr_reader :store, :gvk, :synced
+      attr_reader :store, :gvk, :synced, :sync_error
 
       def initialize(gvk:, store:, api_client:, handlers: [])
         @gvk = gvk
@@ -16,6 +16,7 @@ module KrubyController
         @running = false
         @started = false
         @synced = false
+        @sync_error = nil
       end
 
       def start
@@ -23,6 +24,9 @@ module KrubyController
 
         @started = true
         @running = true
+        # Clear any stale failure from a previous run so a restarted informer
+        # is not immediately reported as failed before it gets to retry.
+        @sync_error = nil
         @populate_thread = Thread.new { populate }
         @watch_thread = Thread.new { watch_loop }
       end
@@ -47,15 +51,56 @@ module KrubyController
 
       private
 
+      POPULATE_INITIAL_BACKOFF = 1.0
+      POPULATE_MAX_BACKOFF = 30.0
+      # Initial List plus three retries (design: "3 retries -> Manager
+      # startup failure"), so four total attempts.
+      POPULATE_MAX_ATTEMPTS = 4
+
+      # Lists the initial state up to POPULATE_MAX_ATTEMPTS times. On success
+      # it marks the informer synced; once the retry budget is exhausted it
+      # records the cause in +sync_error+ so the cache/manager can surface it
+      # and fail startup, instead of leaving the informer inert.
       def populate
-        resp = fetch_list
-        items = resp["items"] || []
-        items.each { |item| @store.add(Delta::ADDED, item) }
-        @resource_version = resp.dig("metadata", "resourceVersion")
-        @synced = true
-      rescue StandardError => e
-        KrubyController.logger.error("Informer populate failed: #{e.message}")
-        raise
+        backoff = POPULATE_INITIAL_BACKOFF
+        attempt = 0
+        while attempt < POPULATE_MAX_ATTEMPTS
+          attempt += 1
+          begin
+            resp = fetch_list
+            items = resp["items"] || []
+            items.each { |item| @store.add(Delta::ADDED, item) }
+            @resource_version = resp.dig("metadata", "resourceVersion")
+            @synced = true
+            return
+          rescue StandardError => e
+            KrubyController.logger.error(
+              "Informer populate for #{@gvk} attempt #{attempt}/#{POPULATE_MAX_ATTEMPTS} failed: #{e.message}"
+            )
+            return unless @running
+
+            if attempt == POPULATE_MAX_ATTEMPTS
+              @sync_error = e
+              return
+            end
+
+            interruptible_sleep(backoff)
+            return unless @running
+
+            backoff = [backoff * 2, POPULATE_MAX_BACKOFF].min
+          end
+        end
+      end
+
+      # Sleeps up to +seconds+, waking early when the informer is stopped so
+      # #stop (which joins this thread) stays responsive.
+      def interruptible_sleep(seconds)
+        slept = 0.0
+        while slept < seconds && @running
+          step = [0.5, seconds - slept].min
+          sleep step
+          slept += step
+        end
       end
 
       def fetch_list
@@ -71,10 +116,12 @@ module KrubyController
 
       def watch_loop
         while @running
-          # Wait for the initial List (or a relist after a break) so the
-          # watch always starts from a known resourceVersion.
-          sleep 0.1 while @running && @resource_version.nil?
+          # Wait for the initial List to complete: success sets @synced, an
+          # exhausted retry budget sets @sync_error. Do not block forever on
+          # a failed initial List (that would leave the informer inert).
+          sleep 0.1 while @running && !@synced && @sync_error.nil?
           break unless @running
+          break if @sync_error
 
           watch_once
           break unless @running

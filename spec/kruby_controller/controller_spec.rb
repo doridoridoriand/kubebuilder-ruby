@@ -333,7 +333,7 @@ RSpec.describe KrubyController::Controller do
       controller.start
       begin
         enqueue_failure("fail-1")
-        poll_until { failing.attempts.size >= 3 }
+        poll_until { failing.attempts.size >= 3 && limiter.failures("default/fail-1") >= 3 }
 
         t0, t1, t2 = failing.attempts
         expect(t1 - t0).to be >= 0.04 # first backoff: base (50ms)
@@ -360,7 +360,7 @@ RSpec.describe KrubyController::Controller do
       controller.start
       begin
         enqueue_failure("flaky-1")
-        poll_until { seen >= 3 }
+        poll_until { seen >= 3 && limiter.failures("default/flaky-1").zero? }
 
         expect(seen).to eq(3)
         expect(limiter.failures("default/flaky-1")).to eq(0)
@@ -407,6 +407,43 @@ RSpec.describe KrubyController::Controller do
         expect(limiter.failures("default/rq-1")).to eq(0)
       ensure
         controller.stop
+      end
+    end
+
+    describe "#handle_result (forget on successful requeue)" do
+      let(:hr_controller) do
+        described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                            rate_limiter: limiter)
+      end
+      let(:request) { KrubyController::Request.new(namespace: "default", name: "hr") }
+      let(:key) { "default/hr" }
+
+      it "resets the failure streak on an error-free RetryAfter" do
+        2.times { limiter.backoff(key) }
+        expect(limiter.failures(key)).to eq(2)
+
+        hr_controller.send(:handle_result, KrubyController::Result.retry_after(1), request, key)
+
+        expect(limiter.failures(key)).to eq(0)
+      end
+
+      it "resets the failure streak on an error-free Requeue" do
+        2.times { limiter.backoff(key) }
+
+        hr_controller.send(:handle_result, KrubyController::Result.requeue, request, key)
+
+        expect(limiter.failures(key)).to eq(0)
+      end
+
+      it "keeps the failure streak when the RetryAfter carries an error" do
+        2.times { limiter.backoff(key) }
+
+        hr_controller.send(
+          :handle_result,
+          KrubyController::Result.retry_after(1, error: StandardError.new("boom")), request, key
+        )
+
+        expect(limiter.failures(key)).to eq(2)
       end
     end
   end

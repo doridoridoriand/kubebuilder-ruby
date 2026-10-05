@@ -74,8 +74,20 @@ module KrubyController
           raise UsageError, "version must be lowercase alphanumerics separated by '-' (got #{version.inspect})"
         end
 
+        # A valid lowercase DNS label also rejects '/' and other path
+        # separators, so the value cannot escape config/crd/bases or alter
+        # the generated Ruby when interpolated.
+        if resource && !FlagParser.dns_label?(resource)
+          raise UsageError, "invalid --resource #{resource.inspect}; must be a lowercase DNS label (e.g. crontasks)"
+        end
+
         @project = load_project!
         @domain = @project["domain"] || "example.com"
+        unless FlagParser.dns_subdomain?(@domain)
+          raise UsageError, "invalid domain #{@domain.inspect} in #{PROJECT_FILE}; must be a DNS subdomain"
+        end
+
+        @name = @project["name"] || FlagParser.normalize_dns_label(File.basename(@root)) || File.basename(@root)
         @group = "#{group}.#{@domain}"
         @version = version
         @kind = kind
@@ -186,7 +198,7 @@ module KrubyController
       end
 
       def scaffold_rbac
-        content = <<~YAML
+        role = <<~YAML
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRole
           metadata:
@@ -199,7 +211,24 @@ module KrubyController
               resources: ["#{@plural}/status"]
               verbs: ["get", "update", "patch"]
         YAML
-        write_generated(File.join(@root, "config/rbac", "#{@snake}_role.yaml"), content)
+        # Bind this API's ClusterRole to the manager ServiceAccount so the
+        # deployment can access the custom resource.
+        binding = <<~YAML
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: #{@name}-#{@snake}-rolebinding
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: #{@snake}-role
+          subjects:
+            - kind: ServiceAccount
+              name: #{@name}-manager
+              namespace: #{@name}
+        YAML
+        write_generated(File.join(@root, "config/rbac", "#{@snake}_role.yaml"), role + binding)
       end
 
       def reconciler_path

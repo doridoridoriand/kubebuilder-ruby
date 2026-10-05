@@ -139,4 +139,41 @@ RSpec.describe KrubyController::CLI::CreateApiCommand do
         .to raise_error(KrubyController::CLI::UsageError, /unknown flag/)
     end
   end
+
+  it "rejects an invalid --resource (uppercase or path separator)" do
+    in_project do
+      expect { create_api("--group", "stable", "--kind", "CronTask", "--resource", "CronTasks") }
+        .to raise_error(KrubyController::CLI::UsageError, /invalid --resource/)
+      expect { create_api("--group", "stable", "--kind", "CronTask", "--resource", "../evil") }
+        .to raise_error(KrubyController::CLI::UsageError, /invalid --resource/)
+    end
+  end
+
+  it "rejects an invalid domain recorded in the project file" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        KrubyController::CLI::InitCommand.new(["--repo", "example.com/proj"]).run
+        root = File.join(dir, "proj")
+        File.write(
+          File.join(root, ".kruby-controller.yml"),
+          "domain: corp_internal\nname: proj\nrepo: example.com/proj\nlicense: apache2\n"
+        )
+        Dir.chdir(root) do
+          expect { create_api("--group", "stable", "--kind", "CronTask") }
+            .to raise_error(KrubyController::CLI::UsageError, /invalid domain/)
+        end
+      end
+    end
+  end
+
+  it "binds the API ClusterRole to the manager ServiceAccount" do
+    in_project do |root|
+      create_api("--group", "stable", "--kind", "CronTask")
+      rbac = File.read(File.join(root, "config/rbac/cron_task_role.yaml"))
+      expect(rbac).to include("kind: ClusterRoleBinding")
+      expect(rbac).to include("name: cron_task-role")
+      expect(rbac).to include("name: proj-manager")
+      expect(rbac).to include("namespace: proj")
+    end
+  end
 end

@@ -43,7 +43,10 @@ RSpec.describe KrubyController::CLI::InitCommand do
         run(["--repo", "my.example.com/my-controller", "--domain", "corp.io", "--license", "mit"])
 
         yml = YAML.safe_load(File.read(File.join(dir, "my-controller/.kruby-controller.yml")))
-        expect(yml).to eq("domain" => "corp.io", "repo" => "my.example.com/my-controller", "license" => "mit")
+        expect(yml).to eq(
+          "name" => "my-controller", "domain" => "corp.io",
+          "repo" => "my.example.com/my-controller", "license" => "mit"
+        )
         expect(File.read(File.join(dir, "my-controller/LICENSE"))).to include("MIT License")
       end
     end
@@ -107,6 +110,60 @@ RSpec.describe KrubyController::CLI::InitCommand do
       Dir.chdir(dir) do
         expect { run(["--repo", "my.example.com/x", "--bogus"]) }
           .to raise_error(KrubyController::CLI::UsageError, /unknown flag/)
+      end
+    end
+  end
+
+  it "rejects unknown short flags" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        expect { run(["--repo", "my.example.com/x", "-x"]) }
+          .to raise_error(KrubyController::CLI::UsageError, /unknown flag/)
+      end
+    end
+  end
+
+  it "rejects an unterminated value flag instead of applying a default" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        expect { run(["--repo", "--force"]) }
+          .to raise_error(KrubyController::CLI::UsageError, /--repo requires a value/)
+        expect(Dir.children(dir)).to be_empty
+      end
+    end
+  end
+
+  it "strips a trailing .git from the repo when deriving the project name" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        expect(run(["--repo", "https://github.com/acme/widget.git"])).to eq(0)
+        yml = YAML.safe_load(File.read(File.join(dir, "widget/.kruby-controller.yml")))
+        expect(yml["name"]).to eq("widget")
+        # The Namespace in the default manifest must be a valid DNS label.
+        default_yaml = File.read(File.join(dir, "widget/config/default.yaml"))
+        expect(default_yaml).to match(/kind: Namespace\nmetadata:\n\s+name: widget\n/)
+      end
+    end
+  end
+
+  it "rejects a domain that is not a DNS subdomain" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        expect { run(["--repo", "my.example.com/x", "--domain", "corp_internal"]) }
+          .to raise_error(KrubyController::CLI::UsageError, /invalid --domain/)
+      end
+    end
+  end
+
+  it "binds the manager ClusterRole to the ServiceAccount in the default manifest" do
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        run(["--repo", "my.example.com/my-controller"])
+        default_yaml = File.read(File.join(dir, "my-controller/config/default.yaml"))
+        expect(default_yaml).to include("kind: ClusterRoleBinding")
+        expect(default_yaml).to include("name: my-controller-manager-role")
+        expect(default_yaml).to include("name: my-controller-manager\n")
+        expect(default_yaml).to include("namespace: my-controller")
       end
     end
   end

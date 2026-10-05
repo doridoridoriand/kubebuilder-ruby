@@ -10,11 +10,12 @@ begin
   when "init"
     KrubyController::CLI::InitCommand.new(ARGV).run
   when "create"
-    case ARGV.shift
+    subcommand = ARGV.shift
+    case subcommand
     when "api"
       KrubyController::CLI::CreateApiCommand.new(ARGV).run
     else
-      warn "Unknown create subcommand: #{ARGV.first.inspect}"
+      warn "Unknown create subcommand: #{subcommand.inspect}"
       warn "Usage: kruby-controller create api --group <G> --kind <K>"
       exit 1
     end

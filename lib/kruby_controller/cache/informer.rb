@@ -126,8 +126,16 @@ module KrubyController
         (old.keys - new.keys).each { |key| notify(Delta::DELETED, old[key]) }
       end
 
+      # Delivers an event to every registered handler. A handler that raises
+      # is logged and skipped so one bad handler cannot suppress the remaining
+      # handlers for this event, nor the events that follow it (critical during
+      # a relist, where the store snapshot is already committed).
       def notify(type, obj)
-        @handlers.each { |h| h.handle(type, obj) }
+        @handlers.each do |h|
+          h.handle(type, obj)
+        rescue StandardError => e
+          KrubyController.logger.error("Handler for #{@gvk} failed on #{type}: #{e.message}")
+        end
       end
 
       def list_path_for(gvk)

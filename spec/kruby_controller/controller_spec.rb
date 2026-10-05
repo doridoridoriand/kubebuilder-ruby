@@ -435,7 +435,7 @@ RSpec.describe KrubyController::Controller do
         expect(limiter.failures(key)).to eq(0)
       end
 
-      it "keeps the failure streak when the RetryAfter carries an error" do
+      it "rate-limits a RetryAfter that carries an error" do
         2.times { limiter.backoff(key) }
 
         hr_controller.send(
@@ -443,7 +443,7 @@ RSpec.describe KrubyController::Controller do
           KrubyController::Result.retry_after(1, error: StandardError.new("boom")), request, key
         )
 
-        expect(limiter.failures(key)).to eq(2)
+        expect(limiter.failures(key)).to eq(3)
       end
     end
   end

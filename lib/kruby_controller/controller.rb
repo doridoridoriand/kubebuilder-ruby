@@ -78,7 +78,15 @@ module KrubyController
             KrubyController.logger.error("Reconcile error for #{request}: #{e.message}")
           end
 
-          return if @queue.shutdown?
+          if @queue.shutdown?
+            # Clear the failure history for a successful completion even
+            # during shutdown: Controller#start reopens the queue without
+            # replacing the limiter, so a stale streak would otherwise make
+            # the first failure after restart wait a doubled delay. The
+            # requeue itself is still suppressed.
+            @queue.forget(request) unless failure
+            return
+          end
 
           # Rate-limit / forget bookkeeping runs while the key is still in
           # flight, so a concurrent event for the same key is parked in the
@@ -106,22 +114,24 @@ module KrubyController
     end
 
     def handle_result(result, request, key)
-      # Explicit backoff requested by the reconciler. An error-free
-      # RetryAfter is a normal deferred requeue: reset the failure streak.
-      if result.is_a?(Result::RetryAfter)
-        @queue.forget(request) unless result.error
-        @queue.add_after(request, result.after)
-        return
-      end
-
-      # A result carrying an error is a failure: rate-limited requeue.
+      # A result carrying an error is a failure: rate-limited requeue,
+      # regardless of the explicit delay the reconciler requested. Checking
+      # this first keeps error-bearing RetryAfter responses on the exponential
+      # schedule instead of retrying on the fixed explicit delay.
       if result.respond_to?(:error) && result.error
         @queue.add_after(request, @rate_limiter.backoff(key))
         return
       end
 
-      # Everything else (Ok, or an error-free Requeue) is a success: reset
-      # the failure streak. A Requeue additionally schedules an immediate retry.
+      # Error-free RetryAfter: honor the explicit delay and reset the streak.
+      if result.is_a?(Result::RetryAfter)
+        @queue.forget(request)
+        @queue.add_after(request, result.after)
+        return
+      end
+
+      # Ok, or an error-free Requeue: reset the streak. A Requeue additionally
+      # schedules an immediate retry.
       @queue.forget(request)
       @queue.add(request) if result.is_a?(Result::Requeue)
     end

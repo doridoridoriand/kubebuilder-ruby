@@ -110,14 +110,14 @@ RSpec.describe KrubyController::Cache::Informer do
         double("request", run: double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}"))
       end
 
-      it "gives up after 3 attempts and records the sync error" do
+      it "gives up after the initial List plus 3 retries and records the sync error" do
         allow(api_client).to receive(:build_request).and_return(failing_request)
         allow(informer).to receive(:interruptible_sleep)
         informer.instance_variable_set(:@running, true)
 
         informer.send(:populate)
 
-        expect(api_client).to have_received(:build_request).exactly(3).times
+        expect(api_client).to have_received(:build_request).exactly(4).times
         expect(informer.synced).to be false
         expect(informer.sync_error).to be_a(KrubyController::Error)
         expect(informer.sync_error.message).to include("403")
@@ -155,6 +155,17 @@ RSpec.describe KrubyController::Cache::Informer do
 
       expect(informer.synced).to be false
       expect(watch_connects).to eq(0)
+      informer.stop
+    end
+
+    it "clears a stale sync error before a new run" do
+      informer.instance_variable_set(:@sync_error, KrubyController::Error.new("stale 403"))
+      allow(informer).to receive(:populate) # no-op: do not re-set sync_error
+
+      informer.start
+
+      expect(informer.sync_error).to be_nil
+    ensure
       informer.stop
     end
   end

@@ -261,11 +261,11 @@ module KrubyController
             replicas: 1
             selector:
               matchLabels:
-                app: #{@name}-manager
+                app: #{@name}
             template:
               metadata:
                 labels:
-                  app: #{@name}-manager
+                  app: #{@name}
               spec:
                 serviceAccountName: #{@name}-manager
                 containers:

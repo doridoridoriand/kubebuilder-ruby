@@ -167,4 +167,19 @@ RSpec.describe KrubyController::CLI::InitCommand do
       end
     end
   end
+
+  it "keeps the Deployment label value within the 63-character limit" do
+    long_name = "a" * 63
+    Dir.mktmpdir do |dir|
+      Dir.chdir(dir) do
+        run(["--repo", "example.com/#{long_name}"])
+        default_yaml = File.read(File.join(dir, long_name, "config/default.yaml"))
+        # The label value uses the unsuffixed project name (<=63 chars); the
+        # Deployment/SA object names may still carry the -manager suffix.
+        expect(default_yaml).to include("app: #{long_name}\n")
+        expect(default_yaml).not_to include("app: #{long_name}-manager")
+        expect(default_yaml).to include("name: #{long_name}-manager\n")
+      end
+    end
+  end
 end

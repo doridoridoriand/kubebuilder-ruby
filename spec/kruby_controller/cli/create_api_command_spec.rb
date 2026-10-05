@@ -171,7 +171,12 @@ RSpec.describe KrubyController::CLI::CreateApiCommand do
       create_api("--group", "stable", "--kind", "CronTask")
       rbac = File.read(File.join(root, "config/rbac/cron_task_role.yaml"))
       expect(rbac).to include("kind: ClusterRoleBinding")
-      expect(rbac).to include("name: cron_task-role")
+      # RBAC object names are DNS subdomains (no underscores), so the
+      # snake_case kind is hyphenated for the role/binding but the file keeps
+      # the underscore.
+      expect(rbac).to include("name: cron-task-role")
+      expect(rbac).to include("name: proj-cron-task-rolebinding")
+      expect(rbac).not_to include("cron_task-role")
       expect(rbac).to include("name: proj-manager")
       expect(rbac).to include("namespace: proj")
     end

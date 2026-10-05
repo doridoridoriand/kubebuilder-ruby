@@ -60,9 +60,15 @@ module KrubyController
       end
 
       # A Kubernetes DNS subdomain: DNS labels separated by '.' (e.g.
-      # "stable.example.com").
+      # "stable.example.com"), at most 253 characters total. A leading or
+      # trailing dot produces an empty label and is rejected.
       def dns_subdomain?(value)
-        value.is_a?(String) && !value.empty? && value.split(".").all? { |label| dns_label?(label) }
+        return false unless value.is_a?(String) && !value.empty?
+        return false if value.length > 253
+
+        # split(".", -1) keeps trailing empty fields so "example.com." is
+        # rejected instead of silently dropping the empty final label.
+        value.split(".", -1).all? { |label| dns_label?(label) }
       end
 
       # Strips a trailing `.git` and normalizes +name+ into a DNS label

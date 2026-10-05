@@ -136,5 +136,16 @@ RSpec.describe KrubyController::Manager do
 
       expect { manager.start }.to raise_error(/cache sync timed out/)
     end
+
+    it "propagates the specific cache sync error instead of a generic timeout" do
+      cache = double("cache", start: true, stop: true, register: double("informer", add_handler: true))
+      allow(cache).to receive(:wait_for_sync)
+        .and_raise(KrubyController::Error.new("Informer list failed (HTTP 403): Forbidden"))
+      manager.instance_variable_set(:@cache, cache)
+      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
+
+      expect { manager.start }.to raise_error(KrubyController::Error, /403/)
+      expect(cache).to have_received(:stop)
+    end
   end
 end

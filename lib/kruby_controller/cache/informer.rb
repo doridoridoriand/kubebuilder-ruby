@@ -5,7 +5,7 @@ require "json"
 module KrubyController
   module Cache
     class Informer
-      attr_reader :store, :gvk, :synced
+      attr_reader :store, :gvk, :synced, :sync_error
 
       def initialize(gvk:, store:, api_client:, handlers: [])
         @gvk = gvk
@@ -16,6 +16,7 @@ module KrubyController
         @running = false
         @started = false
         @synced = false
+        @sync_error = nil
       end
 
       def start
@@ -23,8 +24,11 @@ module KrubyController
 
         @started = true
         @running = true
-        @populate_thread = Thread.new { populate }
-        @watch_thread = Thread.new { watch_loop }
+        # The initial List (with its retry budget) runs to completion before
+        # the watch begins, so the watch always starts from the resourceVersion
+        # of a completed List and never runs concurrently with a retrying
+        # initial population (Kubernetes List/Watch contract).
+        @thread = Thread.new { run }
       end
 
       def wait_for_sync(timeout: 30)
@@ -37,8 +41,7 @@ module KrubyController
         @running = false
         @started = false
         @synced = false
-        @populate_thread&.join
-        @watch_thread&.join
+        @thread&.join
       end
 
       def add_handler(handler)
@@ -47,37 +50,72 @@ module KrubyController
 
       private
 
+      # Populate first, then watch -- sequentially in one thread. The watch
+      # never runs until the initial List has fully succeeded, so a retrying
+      # List cannot be clobbered by watch events (and vice versa).
+      def run
+        populate
+        return unless @running
+        return unless @synced
+
+        watch_loop
+      end
+
       POPULATE_INITIAL_BACKOFF = 1.0
       POPULATE_MAX_BACKOFF = 30.0
+      POPULATE_MAX_ATTEMPTS = 3
 
-      # Repeatedly Lists the initial state until it succeeds (or the informer
-      # is stopped), so a transient API failure at startup does not leave the
-      # informer unsynced forever.
+      # Lists the initial state up to POPULATE_MAX_ATTEMPTS times. On success
+      # it marks the informer synced; once the retry budget is exhausted it
+      # records the cause in +sync_error+ (instead of looping until the
+      # manager's unrelated timeout) so the cache/manager can surface the real
+      # error and fail startup with it.
       def populate
         backoff = POPULATE_INITIAL_BACKOFF
-        loop do
-          list_path = list_path_for(@gvk)
-          request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
-          response = request.run
-          unless response.success?
-            raise KrubyController::Error,
-                  "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
-          end
-          resp = JSON.parse(response.body)
-          items = resp["items"] || []
-          items.each { |item| @store.add(Delta::ADDED, item) }
-          @resource_version = resp.dig("metadata", "resourceVersion")
-          @synced = true
-          return
-        rescue StandardError => e
-          KrubyController.logger.error(
-            "Informer populate failed for #{@gvk}: #{e.message}; retrying in #{backoff}s"
-          )
-          return unless @running
+        attempt = 0
+        while attempt < POPULATE_MAX_ATTEMPTS
+          attempt += 1
+          begin
+            resp = fetch_list
+            items = resp["items"] || []
+            items.each { |item| @store.add(Delta::ADDED, item) }
+            @resource_version = resp.dig("metadata", "resourceVersion")
+            @synced = true
+            return
+          rescue StandardError => e
+            KrubyController.logger.error(
+              "Informer populate for #{@gvk} attempt #{attempt}/#{POPULATE_MAX_ATTEMPTS} failed: #{e.message}"
+            )
+            # A stop is not a sync failure; do not record an error.
+            return unless @running
 
-          interruptible_sleep(backoff)
-          backoff = [backoff * 2, POPULATE_MAX_BACKOFF].min
+            # Exhausted the retry budget: record the real cause so startup
+            # fails with it instead of a generic timeout.
+            if attempt == POPULATE_MAX_ATTEMPTS
+              @sync_error = e
+              return
+            end
+
+            interruptible_sleep(backoff)
+            # Recheck after the (interruptible) backoff so a stop during the
+            # sleep does not trigger one more List, which could write a stale
+            # snapshot and re-mark the cache synced after it was cleared.
+            return unless @running
+
+            backoff = [backoff * 2, POPULATE_MAX_BACKOFF].min
+          end
         end
+      end
+
+      def fetch_list
+        list_path = list_path_for(@gvk)
+        request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
+        response = request.run
+        unless response.success?
+          raise KrubyController::Error,
+                "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
+        end
+        JSON.parse(response.body)
       end
 
       # Sleeps up to +seconds+, waking early when the informer is stopped so

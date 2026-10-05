@@ -204,7 +204,9 @@ RSpec.describe KrubyController::Election::LeaderElector do
 
       elector.run { raise StandardError, "cache sync timed out" }
 
-      wait_until { elector.leading_error }
+      # The renewal loop is stopped and joined *before* the error callback
+      # runs, so wait for the callback (which implies the join completed).
+      wait_until { @error_called && elector.leading_error }
 
       expect(elector.leading_error.message).to include("cache sync timed out")
       expect(@error_called).to be true

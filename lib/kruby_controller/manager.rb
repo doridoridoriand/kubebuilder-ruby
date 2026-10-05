@@ -134,7 +134,13 @@ module KrubyController
     def start_and_sync
       start_controllers
       @cache.start
-      return if @cache.wait_for_sync(timeout: @sync_timeout)
+      begin
+        return if @cache.wait_for_sync(timeout: @sync_timeout)
+      rescue StandardError => e
+        KrubyController.logger.error("Manager: cache sync failed: #{e.message}; stopping")
+        stop_components
+        raise
+      end
 
       message = "cache sync timed out after #{@sync_timeout}s"
       KrubyController.logger.error("Manager: #{message}; stopping")

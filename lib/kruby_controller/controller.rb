@@ -64,51 +64,66 @@ module KrubyController
 
     def worker_loop
       while @running
-        item = @queue.get
-        break if item.equal?(Queue::WorkQueue::SENTINEL)
+        request = @queue.get
+        break if request.equal?(Queue::WorkQueue::SENTINEL)
 
-        request = item
         key = request.namespaced_name.to_s
-        result = nil
         failure = false
+        result = nil
         begin
-          result = @reconciler.reconcile(request)
-        rescue StandardError => e
-          failure = true
-          KrubyController.logger.error("Reconcile error for #{request}: #{e.message}")
+          begin
+            result = @reconciler.reconcile(request)
+          rescue StandardError => e
+            failure = true
+            KrubyController.logger.error("Reconcile error for #{request}: #{e.message}")
+          end
+
+          return if @queue.shutdown?
+
+          # Rate-limit / forget bookkeeping runs while the key is still in
+          # flight, so a concurrent event for the same key is parked in the
+          # dirty set instead of racing the failure counter.
+          if failure
+            requeue_with_backoff(request, key)
+          else
+            handle_result(result, request, key)
+          end
         ensure
           @queue.done(request)
-        end
-        return if @queue.shutdown?
-
-        if failure
-          requeue_with_backoff(request, key)
-        else
-          handle_result(result, request, key)
         end
       end
     end
 
     # Re-queues a failed reconcile after a per-key exponential backoff delay
-    # (5ms base, doubling per consecutive failure, capped at 5s by default).
+    # (5s base, doubling per consecutive failure, capped at 300s by default).
     def requeue_with_backoff(request, key)
       delay = @rate_limiter.backoff(key)
       KrubyController.logger.info(
-        "Requeueing #{request} in #{(delay * 1000).round} ms " \
+        "Requeueing #{request} in #{delay} s " \
         "(consecutive failures: #{@rate_limiter.failures(key)})"
       )
       @queue.add_after(request, delay)
     end
 
     def handle_result(result, request, key)
-      # Explicit backoff requested by the reconciler; leaves the per-key
-      # failure count untouched.
-      return @queue.add_after(request, result.after) if result.is_a?(Result::RetryAfter)
-      # A result carrying an error is a failure: rate-limited requeue.
-      return @queue.add_after(request, @rate_limiter.backoff(key)) if result.respond_to?(:error) && result.error
-      return @queue.add(request) if result.is_a?(Result::Requeue)
+      # Explicit backoff requested by the reconciler. An error-free
+      # RetryAfter is a normal deferred requeue: reset the failure streak.
+      if result.is_a?(Result::RetryAfter)
+        @queue.forget(request) unless result.error
+        @queue.add_after(request, result.after)
+        return
+      end
 
+      # A result carrying an error is a failure: rate-limited requeue.
+      if result.respond_to?(:error) && result.error
+        @queue.add_after(request, @rate_limiter.backoff(key))
+        return
+      end
+
+      # Everything else (Ok, or an error-free Requeue) is a success: reset
+      # the failure streak. A Requeue additionally schedules an immediate retry.
       @queue.forget(request)
+      @queue.add(request) if result.is_a?(Result::Requeue)
     end
   end
 end

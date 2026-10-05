@@ -7,13 +7,13 @@ module KrubyController
     # consecutive failure for a key waits base * 2**(n-1) seconds, capped at
     # max. Keys are independent: a failing key never slows down others.
     #
-    #   limiter = ExponentialBackoffRateLimiter.new(base: 0.005, max: 5.0)
-    #   limiter.backoff("default/foo") # => 0.005
-    #   limiter.backoff("default/foo") # => 0.01
+    #   limiter = ExponentialBackoffRateLimiter.new(base: 5.0, max: 300.0)
+    #   limiter.backoff("default/foo") # => 5.0
+    #   limiter.backoff("default/foo") # => 10.0
     #   limiter.forget("default/foo")  # successful reconcile resets the count
     class ExponentialBackoffRateLimiter
-      DEFAULT_BASE = 0.005
-      DEFAULT_MAX = 5.0
+      DEFAULT_BASE = 5.0
+      DEFAULT_MAX = 300.0
 
       def initialize(base: DEFAULT_BASE, max: DEFAULT_MAX)
         raise ArgumentError, "base must be positive" unless base.positive?

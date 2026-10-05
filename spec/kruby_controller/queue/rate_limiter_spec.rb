@@ -26,10 +26,10 @@ RSpec.describe KrubyController::Queue::ExponentialBackoffRateLimiter do
       expect(limiter.failures("b")).to eq(1)
     end
 
-    it "defaults to controller-runtime-compatible 5ms base / 5s max" do
+    it "defaults to a 5s base / 300s cap per issue #8" do
       limiter = described_class.new
-      expect(limiter.base).to eq(0.005)
-      expect(limiter.max).to eq(5.0)
+      expect(limiter.base).to eq(5.0)
+      expect(limiter.max).to eq(300.0)
     end
 
     it "rejects non-positive base or max" do

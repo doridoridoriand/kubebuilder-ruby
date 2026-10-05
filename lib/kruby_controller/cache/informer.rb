@@ -24,6 +24,9 @@ module KrubyController
 
         @started = true
         @running = true
+        # Clear the previous run's failure so a restarted informer is not
+        # immediately reported as failed before the new List thread runs.
+        @sync_error = nil
         # The initial List (with its retry budget) runs to completion before
         # the watch begins, so the watch always starts from the resourceVersion
         # of a completed List and never runs concurrently with a retrying
@@ -63,7 +66,9 @@ module KrubyController
 
       POPULATE_INITIAL_BACKOFF = 1.0
       POPULATE_MAX_BACKOFF = 30.0
-      POPULATE_MAX_ATTEMPTS = 3
+      # Initial List plus three retries (design: "3 retries -> Manager
+      # startup failure"), so four total attempts.
+      POPULATE_MAX_ATTEMPTS = 4
 
       # Lists the initial state up to POPULATE_MAX_ATTEMPTS times. On success
       # it marks the informer synced; once the retry budget is exhausted it

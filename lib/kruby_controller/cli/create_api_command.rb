@@ -95,6 +95,10 @@ module KrubyController
         @namespaced = !cluster_scoped
         @force = force
         @snake = snake_case(kind)
+        # Kubernetes RBAC object names are DNS subdomains (no underscores),
+        # so derive a hyphenated name for the ClusterRole/Binding while
+        # @snake keeps the underscores for Ruby file names.
+        @rbac_name = @snake.tr("_", "-")
         @plural = resource || default_plural
         @created = []
 
@@ -202,7 +206,7 @@ module KrubyController
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRole
           metadata:
-            name: #{@snake}-role
+            name: #{@rbac_name}-role
           rules:
             - apiGroups: ["#{@group}"]
               resources: ["#{@plural}"]
@@ -218,11 +222,11 @@ module KrubyController
           apiVersion: rbac.authorization.k8s.io/v1
           kind: ClusterRoleBinding
           metadata:
-            name: #{@name}-#{@snake}-rolebinding
+            name: #{@name}-#{@rbac_name}-rolebinding
           roleRef:
             apiGroup: rbac.authorization.k8s.io
             kind: ClusterRole
-            name: #{@snake}-role
+            name: #{@rbac_name}-role
           subjects:
             - kind: ServiceAccount
               name: #{@name}-manager

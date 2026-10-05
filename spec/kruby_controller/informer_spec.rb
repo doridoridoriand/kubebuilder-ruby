@@ -104,6 +104,59 @@ RSpec.describe KrubyController::Cache::Informer do
         expect(store.get("default", "a")).to be_a(Hash)
       end
     end
+
+    context "when the list keeps failing" do
+      let(:failing_request) do
+        double("request", run: double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}"))
+      end
+
+      it "gives up after 3 attempts and records the sync error" do
+        allow(api_client).to receive(:build_request).and_return(failing_request)
+        allow(informer).to receive(:interruptible_sleep)
+        informer.instance_variable_set(:@running, true)
+
+        informer.send(:populate)
+
+        expect(api_client).to have_received(:build_request).exactly(3).times
+        expect(informer.synced).to be false
+        expect(informer.sync_error).to be_a(KrubyController::Error)
+        expect(informer.sync_error.message).to include("403")
+      end
+
+      it "does not record a sync error when stopped mid-retry" do
+        allow(api_client).to receive(:build_request).and_return(failing_request)
+        allow(informer).to receive(:interruptible_sleep) do
+          informer.instance_variable_set(:@running, false) # simulate a stop during backoff
+        end
+        informer.instance_variable_set(:@running, true)
+
+        informer.send(:populate)
+
+        expect(informer.synced).to be false
+        expect(informer.sync_error).to be_nil
+      end
+    end
+
+    it "never opens the watch while the initial List is still failing" do
+      watch_connects = 0
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      allow(fake_watch).to receive(:connect) { |_path, &_blk| watch_connects += 1 }
+
+      allow(api_client).to receive(:build_request).and_return(
+        double("request",
+               run: double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}"))
+      )
+      allow(informer).to receive(:interruptible_sleep)
+
+      informer.start
+      deadline = Time.now + 5
+      sleep 0.05 until informer.sync_error || Time.now >= deadline
+
+      expect(informer.synced).to be false
+      expect(watch_connects).to eq(0)
+      informer.stop
+    end
   end
 
   describe "list path resolution" do

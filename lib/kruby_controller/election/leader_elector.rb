@@ -81,11 +81,15 @@ module KrubyController
           rescue StandardError => e
             KrubyController.logger.error("LeaderElector: on_started_leading failed: #{e.message}")
             @leading_error = e
-            @on_leading_error&.call
+            # Stop and join the renewal loop BEFORE invoking external callback
+            # code: the callback (e.g. the manager's shutdown path) may raise,
+            # and we must not leave the renewal thread running and renewing the
+            # lease after the election thread unwinds into ensure.
             @running = false
             @renewal_running = false
             @leader = false
             renewal_thread.join
+            @on_leading_error&.call
             break
           end
           renewal_thread.join

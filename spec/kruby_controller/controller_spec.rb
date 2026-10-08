@@ -446,6 +446,34 @@ RSpec.describe KrubyController::Controller do
         expect(limiter.failures(key)).to eq(3)
       end
     end
+
+    describe "#clear_failure_on_shutdown?" do
+      let(:c) do
+        described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                            rate_limiter: limiter)
+      end
+
+      it "clears the history for a clean Ok" do
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.ok)).to be(true)
+      end
+
+      it "clears the history for an error-free RetryAfter / Requeue" do
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.retry_after(1))).to be(true)
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.requeue)).to be(true)
+      end
+
+      it "does NOT clear when the reconcile raised" do
+        expect(c.send(:clear_failure_on_shutdown?, true, KrubyController::Result.ok)).to be(false)
+      end
+
+      it "does NOT clear when the result carries an error" do
+        requeue_err = KrubyController::Result.requeue(error: StandardError.new("x"))
+        retry_err = KrubyController::Result.retry_after(1, error: StandardError.new("x"))
+
+        expect(c.send(:clear_failure_on_shutdown?, false, requeue_err)).to be(false)
+        expect(c.send(:clear_failure_on_shutdown?, false, retry_err)).to be(false)
+      end
+    end
   end
 end
 

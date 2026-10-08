@@ -58,9 +58,18 @@ module KrubyController
       POPULATE_MAX_ATTEMPTS = 4
 
       # Lists the initial state up to POPULATE_MAX_ATTEMPTS times. On success
-      # it marks the informer synced; once the retry budget is exhausted it
-      # records the cause in +sync_error+ so the cache/manager can surface it
-      # and fail startup, instead of leaving the informer inert.
+      # it replaces the store (dropping objects deleted since the previous
+      # run) and emits the snapshot diff, then marks the informer synced;
+      # once the retry budget is exhausted it records the cause in
+      # +sync_error+ so the cache/manager can surface it and fail startup,
+      # instead of leaving the informer inert.
+      #
+      # Replacing (rather than upserting) matters when the same informer is
+      # reused after a stop (e.g. leadership reacquisition): an object deleted
+      # while the informer was stopped would otherwise linger in the store
+      # forever, since the resumed watch starts at the fresh List's
+      # resourceVersion. On the first run the store is empty, so the diff is
+      # simply ADDED for every object (standard informer initial-list).
       def populate
         backoff = POPULATE_INITIAL_BACKOFF
         attempt = 0
@@ -69,7 +78,8 @@ module KrubyController
           begin
             resp = fetch_list
             items = resp["items"] || []
-            items.each { |item| @store.add(Delta::ADDED, item) }
+            old, new = @store.replace(items)
+            emit_relist_events(old, new)
             @resource_version = resp.dig("metadata", "resourceVersion")
             @synced = true
             return

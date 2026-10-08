@@ -85,6 +85,17 @@ RSpec.describe KrubyController::Manager do
     end
   end
 
+  describe "namespace option" do
+    it "propagates the namespace to registered informers" do
+      manager = described_class.new(namespace: "team-a")
+      gvk = KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask")
+
+      informer = manager.cache.register(gvk: gvk)
+
+      expect(informer.instance_variable_get(:@namespace)).to eq("team-a")
+    end
+  end
+
   describe "startup failure (cache cannot sync)" do
     it "stops components and raises when the cache cannot sync (no leader election)" do
       manager = described_class.new(leader_elect: false)

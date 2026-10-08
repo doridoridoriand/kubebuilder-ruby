@@ -125,6 +125,25 @@ RSpec.describe KrubyController::Queue::WorkQueue do
 
       expect(queue.get).to eq(req_a)
     end
+
+    it "rejects scheduling while the queue is closed" do
+      queue.shutdown(1)
+
+      expect(queue.add_after(req_a, 0.05)).to be(false)
+      # Only the shutdown sentinel is present; req_a was not scheduled.
+      expect(queue.get).to equal(KrubyController::Queue::WorkQueue::SENTINEL)
+      expect(queue.len).to eq(0)
+    end
+
+    it "discards a pending delayed retry after shutdown + reset (no stale work)" do
+      queue.add_after(req_a, 0.1)
+      queue.shutdown(1)
+      queue.reset
+
+      # Let the (now invalidated) timer fire; it must not enqueue stale work.
+      sleep 0.25
+      expect(queue.len).to eq(0)
+    end
   end
 
   describe "#add_rate_limited / #forget" do
@@ -135,6 +154,20 @@ RSpec.describe KrubyController::Queue::WorkQueue do
 
     it "raises when the queue has no rate limiter" do
       expect { queue.add_rate_limited(req_a) }.to raise_error(ArgumentError, /rate_limiter/)
+    end
+
+    it "does not record a backoff or schedule when the queue is closed" do
+      limiter = KrubyController::Queue::ExponentialBackoffRateLimiter.new(base: 0.05, max: 1)
+      q = described_class.new(rate_limiter: limiter)
+      q.shutdown(1)
+
+      q.add_rate_limited(req_a)
+
+      expect(limiter.failures("default/a")).to eq(0)
+      sleep 0.1
+      # Only the shutdown sentinel is present; no rate-limited work was scheduled.
+      expect(q.get).to equal(KrubyController::Queue::WorkQueue::SENTINEL)
+      expect(q.len).to eq(0)
     end
 
     it "enqueues after the limiter's delay" do

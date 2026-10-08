@@ -79,12 +79,13 @@ module KrubyController
           end
 
           if @queue.shutdown?
-            # Clear the failure history for a successful completion even
-            # during shutdown: Controller#start reopens the queue without
-            # replacing the limiter, so a stale streak would otherwise make
-            # the first failure after restart wait a doubled delay. The
-            # requeue itself is still suppressed.
-            @queue.forget(request) unless failure
+            # Only a truly successful completion clears the failure history.
+            # Controller#start reopens the queue without replacing the
+            # limiter, so a stale streak would otherwise make the first
+            # failure after restart wait a doubled delay; but an error-bearing
+            # result (or a raised exception) is a failure and must keep its
+            # streak. The requeue itself is still suppressed.
+            @queue.forget(request) if clear_failure_on_shutdown?(failure, result)
             return
           end
 
@@ -134,6 +135,19 @@ module KrubyController
       # schedules an immediate retry.
       @queue.forget(request)
       @queue.add(request) if result.is_a?(Result::Requeue)
+    end
+
+    # Whether a completion that finishes while the queue is shutting down
+    # should clear its per-key failure history. Only a truly successful
+    # completion does: no raised exception (+failed+) and no error-bearing
+    # result. An error-bearing result (or exception) is a failure, and its
+    # streak must survive so the next failure after a restart does not drop
+    # back to the base delay.
+    def clear_failure_on_shutdown?(failed, result)
+      return false if failed
+      return false if result.respond_to?(:error) && !result.error.nil?
+
+      true
     end
   end
 end

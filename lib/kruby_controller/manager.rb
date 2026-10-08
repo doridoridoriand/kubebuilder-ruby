@@ -20,7 +20,7 @@ module KrubyController
       @leader_elect = leader_elect
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
       @logger = logger
-      @cache = Cache::SharedCache.new(kube_config:)
+      @cache = Cache::SharedCache.new(kube_config:, namespace:)
       @controllers = []
       @stopped = false
       @stop_channel = Channel.new

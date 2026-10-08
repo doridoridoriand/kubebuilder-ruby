@@ -24,6 +24,7 @@ module KrubyController
       @controllers = []
       @stopped = false
       @stop_channel = Channel.new
+      @startup_error = nil
       KrubyController.logger = @logger if @logger
     end
 
@@ -40,7 +41,8 @@ module KrubyController
         watches: Array(options.fetch(:watches, [])).map do |w|
           w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w
         end,
-        predicate: options[:predicate]
+        predicate: options[:predicate],
+        rate_limiter: options[:rate_limiter]
       )
       @controllers << controller
       controller
@@ -59,13 +61,30 @@ module KrubyController
           on_stopped_leading: -> { stop_components },
           **@lease_opts
         )
-        @leader_elector.run { start_and_sync }
+        @leader_elector.run { start_leading }
+        setup_signal_handlers
+        @stop_channel.receive
+        # Safe from the main thread (a different thread than the elector's
+        # election_loop), so #stop's join cannot deadlock. Stopping first
+        # releases the lease and halts renewal before we fail startup.
+        @leader_elector&.stop
+        raise @startup_error if @startup_error
       else
         start_and_sync
       end
+    end
 
-      setup_signal_handlers
-      @stop_channel.receive
+    # Startup work under leadership. On a fatal startup failure (the cache
+    # cannot sync), record the error and signal the stop channel so
+    # Manager#start fails with the real cause instead of keeping leadership
+    # with running controllers and an inert informer. start_and_sync has
+    # already stopped the components before re-raising.
+    def start_leading
+      start_and_sync
+    rescue StandardError => e
+      @startup_error = e
+      @stop_channel.send(:stopped)
+      raise
     end
 
     def stop(timeout: 30)
@@ -128,6 +147,12 @@ module KrubyController
       start_controllers
       @cache.start
       @cache.wait_for_sync
+    rescue StandardError => e
+      # A cache that cannot sync is fatal: stop the components we just
+      # started and let the error propagate (Manager#start fails with it).
+      KrubyController.logger.error("Manager: cache sync failed: #{e.message}; stopping components")
+      stop_components
+      raise
     end
 
     def stop_components

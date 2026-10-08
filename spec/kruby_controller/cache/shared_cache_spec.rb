@@ -88,13 +88,37 @@ RSpec.describe KrubyController::Cache::SharedCache do
       cache.stop
     end
 
-    it "wait_for_sync delegates to every informer" do
+    it "returns true once every informer is synced" do
       informer = cache.register(gvk: gvk)
       other = cache.register(gvk: other_gvk)
-      expect(informer).to receive(:wait_for_sync).with(timeout: 30)
-      expect(other).to receive(:wait_for_sync).with(timeout: 30)
+      allow(informer).to receive(:synced).and_return(true)
+      allow(informer).to receive(:sync_error).and_return(nil)
+      allow(other).to receive(:synced).and_return(true)
+      allow(other).to receive(:sync_error).and_return(nil)
 
-      cache.wait_for_sync
+      expect(cache.wait_for_sync).to be(true)
+    end
+
+    it "does not report synced until every informer is synced" do
+      informer = cache.register(gvk: gvk)
+      other = cache.register(gvk: other_gvk)
+      allow(informer).to receive(:synced).and_return(true)
+      allow(informer).to receive(:sync_error).and_return(nil)
+      # 'other' never syncs, so wait_for_sync must time out (false), proving
+      # it waits for every registered informer, not just the first.
+      allow(other).to receive(:synced).and_return(false)
+      allow(other).to receive(:sync_error).and_return(nil)
+
+      expect(cache.wait_for_sync(timeout: 0.2)).to be(false)
+    end
+
+    it "raises the informer's sync error when one exhausts its initial-List retries" do
+      informer = cache.register(gvk: gvk)
+      err = KrubyController::Error.new("Informer list failed (HTTP 403)")
+      allow(informer).to receive(:synced).and_return(false)
+      allow(informer).to receive(:sync_error).and_return(err)
+
+      expect { cache.wait_for_sync(timeout: 1) }.to raise_error(KrubyController::Error, /403/)
     end
   end
 

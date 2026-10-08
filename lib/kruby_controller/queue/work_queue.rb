@@ -26,7 +26,8 @@ module KrubyController
     class WorkQueue
       SENTINEL = Object.new.freeze
 
-      def initialize
+      def initialize(rate_limiter: nil)
+        @rate_limiter = rate_limiter
         # Thread::Queue gives us O(1) FIFO push/pop. Its operations are
         # performed while @mutex is held so that popping an item and moving
         # its key from pending to in flight remain one atomic transition.
@@ -37,25 +38,84 @@ module KrubyController
         @mutex = Mutex.new
         @cond = ConditionVariable.new
         @closed = false
+        # Lifecycle counter for delayed retries. Bumped on every #reset so a
+        # retry scheduled in a previous lifecycle is discarded when it wakes
+        # (Controller#start reopens the same queue via #reset).
+        @retry_seq = 0
       end
 
       def add(request)
         @mutex.synchronize do
           return if @closed
 
-          key = request.namespaced_name.to_s
-          if @in_flight.key?(key)
-            @dirty.add(key)
-          elsif !@pending_keys.include?(key)
-            @pending_keys.add(key)
-            @queue << request
-          end
-          @cond.signal
+          do_add(request)
         end
       end
 
+      # Schedules +request+ to be enqueued after +seconds+. The retry is owned
+      # by the queue: it is rejected while the queue is closed and is
+      # invalidated (discarded, not enqueued) if the queue is shut down or
+      # reset before the timer fires, so a retry from a previous lifecycle can
+      # never inject stale work after Controller#start reopens the queue.
+      # Returns false when the queue is already closed and no timer was
+      # started; true otherwise.
       def add_after(request, seconds)
-        Thread.new { sleep seconds; add(request) }
+        gen = @mutex.synchronize { @closed ? :closed : @retry_seq }
+        return false if gen == :closed
+
+        Thread.new do
+          sleep seconds
+          enqueue_when_valid(request, gen)
+        end
+        true
+      end
+
+      # Re-queues +request+ after a delay decided by the rate limiter
+      # (controller-runtime's AddRateLimited). Requires a queue built with a
+      # rate_limiter. Does nothing (and records no backoff) when the queue is
+      # already closed.
+      def add_rate_limited(request)
+        raise ArgumentError, "WorkQueue#add_rate_limited requires a rate_limiter" unless @rate_limiter
+
+        return false if @mutex.synchronize { @closed }
+
+        delay = @rate_limiter.backoff(request.namespaced_name.to_s)
+        gen = @mutex.synchronize { @retry_seq }
+        Thread.new do
+          sleep delay
+          enqueue_when_valid(request, gen)
+        end
+        true
+      end
+
+      # Shared enqueue logic; the caller must hold @mutex.
+      def do_add(request)
+        key = request.namespaced_name.to_s
+        if @in_flight.key?(key)
+          @dirty.add(key)
+        elsif !@pending_keys.include?(key)
+          @pending_keys.add(key)
+          @queue << request
+        end
+        @cond.signal
+      end
+
+      # Invoked by a delayed-retry timer once it wakes. Enqueues only if the
+      # queue is still open and belongs to the same lifecycle the timer was
+      # created for (i.e. no shutdown/reset has invalidated it).
+      def enqueue_when_valid(request, gen)
+        @mutex.synchronize do
+          return if @closed
+          return unless gen == @retry_seq
+
+          do_add(request)
+        end
+      end
+
+      # Clears the rate limiter state for +request+'s key (controller-runtime's
+      # Forget); a no-op when the queue has no rate limiter.
+      def forget(request)
+        @rate_limiter&.forget(request.namespaced_name.to_s)
       end
 
       # Blocks until an item is available, atomically dequeueing it and
@@ -65,6 +125,7 @@ module KrubyController
           loop do
             if @queue.empty?
               return SENTINEL if @closed
+
               @cond.wait(@mutex)
               next
             end
@@ -141,6 +202,8 @@ module KrubyController
           @in_flight = {}
           @dirty = Set.new
           @closed = false
+          # Invalidate any delayed retries scheduled in the previous lifecycle.
+          @retry_seq += 1
           @cond.broadcast
         end
       end

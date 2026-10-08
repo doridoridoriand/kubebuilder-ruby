@@ -10,6 +10,10 @@ RSpec.describe KrubyController::Cache::Store do
   let(:deleted) { KrubyController::Cache::Delta::DELETED }
   let(:bookkeeper) { KrubyController::Cache::Delta::BOOKKEEPER }
 
+  def item(name, rev, namespace: "default")
+    { "metadata" => { "namespace" => namespace, "name" => name, "resourceVersion" => rev } }
+  end
+
   describe "#add" do
     it "stores an object on ADDED" do
       store.add(added, obj_a)
@@ -82,6 +86,30 @@ RSpec.describe KrubyController::Cache::Store do
 
     it "returns an empty list when nothing matches the selector" do
       expect(store.list(label_selector: "app=missing")).to eq([])
+    end
+  end
+
+  describe "#replace" do
+    it "replaces the contents and returns the old and new maps" do
+      store.add(added, item("a", "1"))
+      store.add(added, item("b", "2"))
+
+      old, new = store.replace([item("b", "3"), item("c", "4")])
+
+      expect(old.keys).to match_array(%w[default/a default/b])
+      expect(new.keys).to match_array(%w[default/b default/c])
+      expect(store.get("default", "a")).to be_nil
+      expect(store.get("default", "b").dig("metadata", "resourceVersion")).to eq("3")
+      expect(store.get("default", "c")).to be_a(Hash)
+    end
+
+    it "accepts an empty list, emptying the store" do
+      store.add(added, item("a", "1"))
+
+      _old, new = store.replace([])
+
+      expect(new).to be_empty
+      expect(store.list).to be_empty
     end
   end
 end

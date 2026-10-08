@@ -40,7 +40,8 @@ module KrubyController
         watches: Array(options.fetch(:watches, [])).map do |w|
           w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w
         end,
-        predicate: options[:predicate]
+        predicate: options[:predicate],
+        rate_limiter: options[:rate_limiter]
       )
       @controllers << controller
       controller

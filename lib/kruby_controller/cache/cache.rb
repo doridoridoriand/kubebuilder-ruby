@@ -3,8 +3,9 @@
 module KrubyController
   module Cache
     class SharedCache
-      def initialize(kube_config: nil)
+      def initialize(kube_config: nil, namespace: nil)
         @kube_config = kube_config
+        @namespace = namespace
         @informers = {}
         @mutex = Mutex.new
       end
@@ -12,8 +13,9 @@ module KrubyController
       def register(gvk:)
         @mutex.synchronize do
           return @informers[gvk.to_s] if @informers.key?(gvk.to_s)
+
           store = Store.new
-          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [])
+          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [], namespace: @namespace)
           @informers[gvk.to_s] = informer
           informer
         end
@@ -22,12 +24,14 @@ module KrubyController
       def get(gvk, namespace, name)
         informer = @informers[gvk.to_s]
         return nil unless informer
+
         informer.store.get(namespace, name)
       end
 
       def list(gvk, namespace: nil, label_selector: nil)
         informer = @informers[gvk.to_s]
         return [] unless informer
+
         results = informer.store.list(label_selector:)
         results = results.select { |o| ns_matches?(o, namespace) } if namespace
         results
@@ -63,12 +67,12 @@ module KrubyController
       def api_client
         @api_client ||= begin
           config = if @kube_config
-            cfg = Kubernetes::Configuration.new
-            Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
-            cfg
-          else
-            Kubernetes::Configuration.default_config
-          end
+                     cfg = Kubernetes::Configuration.new
+                     Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
+                     cfg
+                   else
+                     Kubernetes::Configuration.default_config
+                   end
           Kubernetes::ApiClient.new(config)
         end
       end

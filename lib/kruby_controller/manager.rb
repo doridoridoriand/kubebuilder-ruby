@@ -20,7 +20,7 @@ module KrubyController
       @leader_elect = leader_elect
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
       @logger = logger
-      @cache = Cache::SharedCache.new(kube_config:)
+      @cache = Cache::SharedCache.new(kube_config:, namespace:)
       @controllers = []
       @stopped = false
       @stop_channel = Channel.new
@@ -38,7 +38,9 @@ module KrubyController
         max_concurrent: options.fetch(:max_concurrent, 1),
         name: options[:name],
         owns: Array(options.fetch(:owns, [])).map { |target| resolve_target(target, options) },
-        watches: Array(options.fetch(:watches, [])).map { |w| w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w },
+        watches: Array(options.fetch(:watches, [])).map do |w|
+          w[:gvk] ? w.merge(gvk: resolve_target(w[:gvk], options)) : w
+        end,
         predicate: options[:predicate]
       )
       @controllers << controller
@@ -86,6 +88,7 @@ module KrubyController
 
     def stop(timeout: 30)
       return if @stopped
+
       @stopped = true
       KrubyController.logger.info("Stopping manager...")
       @leader_elector&.stop
@@ -95,6 +98,7 @@ module KrubyController
 
     def leader?
       return true unless @leader_elect
+
       @leader_elector&.leader || false
     end
 
@@ -168,12 +172,12 @@ module KrubyController
     def coordination_client
       @coordination_client ||= begin
         config = if @kube_config
-          cfg = Kubernetes::Configuration.new
-          Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
-          cfg
-        else
-          Kubernetes::Configuration.default_config
-        end
+                   cfg = Kubernetes::Configuration.new
+                   Kubernetes::KubeConfig.new(@kube_config).configure(cfg)
+                   cfg
+                 else
+                   Kubernetes::Configuration.default_config
+                 end
         Kubernetes::CoordinationV1Api.new(Kubernetes::ApiClient.new(config))
       end
     end

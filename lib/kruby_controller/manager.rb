@@ -22,7 +22,7 @@ module KrubyController
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
       @sync_timeout = sync_timeout
       @logger = logger
-      @cache = Cache::SharedCache.new(kube_config:)
+      @cache = Cache::SharedCache.new(kube_config:, namespace:)
       @controllers = []
       @stopped = false
       @stop_channel = Channel.new

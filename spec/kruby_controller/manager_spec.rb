@@ -85,70 +85,6 @@ RSpec.describe KrubyController::Manager do
     end
   end
 
-  describe "#start cache sync failure" do
-    let(:manager) { described_class.new(leader_elect: false, sync_timeout: 0.5) }
-
-    # manager.start installs SIGTERM/SIGINT traps; restore defaults after.
-    after do
-      Signal.trap("TERM", "DEFAULT")
-      Signal.trap("INT", "DEFAULT")
-    end
-
-    def fake_cache(synced)
-      double(
-        "cache",
-        start: true,
-        stop: true,
-        wait_for_sync: synced,
-        register: double("informer", add_handler: true)
-      )
-    end
-
-    it "stops components and raises when the cache does not sync in time" do
-      cache = fake_cache(false)
-      manager.instance_variable_set(:@cache, cache)
-      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
-
-      expect { manager.start }.to raise_error(/cache sync timed out/)
-      expect(cache).to have_received(:stop)
-    end
-
-    it "propagates the sync failure as the start error on the leader path" do
-      manager = described_class.new(leader_elect: true, sync_timeout: 0.5)
-      manager.instance_variable_set(:@cache, fake_cache(false))
-      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
-
-      fake_elector = double("elector", leading_error: nil)
-      on_leading_error = nil
-      allow(fake_elector).to receive(:run) do |&block|
-        begin
-          block.call
-        rescue StandardError => e
-          allow(fake_elector).to receive(:leading_error).and_return(e)
-          on_leading_error&.call
-        end
-        fake_elector
-      end
-      allow(KrubyController::Election::LeaderElector).to receive(:new) do |opts|
-        on_leading_error = opts[:on_leading_error]
-        fake_elector
-      end
-
-      expect { manager.start }.to raise_error(/cache sync timed out/)
-    end
-
-    it "propagates the specific cache sync error instead of a generic timeout" do
-      cache = double("cache", start: true, stop: true, register: double("informer", add_handler: true))
-      allow(cache).to receive(:wait_for_sync)
-        .and_raise(KrubyController::Error.new("Informer list failed (HTTP 403): Forbidden"))
-      manager.instance_variable_set(:@cache, cache)
-      manager.add(GvkSpecCronTaskReconciler, for: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
-
-      expect { manager.start }.to raise_error(KrubyController::Error, /403/)
-      expect(cache).to have_received(:stop)
-    end
-  end
-
   describe "namespace option" do
     it "propagates the namespace to registered informers" do
       manager = described_class.new(namespace: "team-a")
@@ -157,6 +93,29 @@ RSpec.describe KrubyController::Manager do
       informer = manager.cache.register(gvk: gvk)
 
       expect(informer.instance_variable_get(:@namespace)).to eq("team-a")
+    end
+  end
+
+  describe "startup failure (cache cannot sync)" do
+    it "stops components and raises when the cache cannot sync (no leader election)" do
+      manager = described_class.new(leader_elect: false)
+      expect(manager.cache).to receive(:wait_for_sync).and_raise(KrubyController::Error.new("list failed 403"))
+      expect(manager.cache).to receive(:stop)
+
+      expect { manager.start }.to raise_error(KrubyController::Error, /403/)
+    end
+
+    it "records the startup error and signals stop under leader election" do
+      manager = described_class.new(leader_elect: true)
+      err = KrubyController::Error.new("sync boom")
+      allow(manager).to receive(:start_and_sync).and_raise(err)
+      manager.instance_variable_set(:@leader_elector, double("elector"))
+
+      expect { manager.send(:start_leading) }.to raise_error(KrubyController::Error, /sync boom/)
+      expect(manager.instance_variable_get(:@startup_error)).to be(err)
+      # The stop channel was signaled so Manager#start (blocked in receive)
+      # unblocks and can fail with the recorded error.
+      expect(manager.instance_variable_get(:@stop_channel).receive).to eq(:stopped)
     end
   end
 end

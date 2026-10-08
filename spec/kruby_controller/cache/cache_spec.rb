@@ -7,9 +7,7 @@ RSpec.describe KrubyController::Cache::SharedCache do
 
   describe "#wait_for_sync" do
     it "returns true immediately when there are no informers" do
-      cache = described_class.new
-
-      expect(cache.wait_for_sync(timeout: 1)).to be(true)
+      expect(described_class.new.wait_for_sync(timeout: 1)).to be(true)
     end
 
     it "returns true once every informer is synced" do

@@ -16,12 +16,8 @@ module KrubyController
     # While leading, the lease is renewed every retry_period. When leadership
     # is lost (lease taken over by another identity), the renewal stops and
     # on_stopped_leading is invoked; the elector then keeps retrying.
-    #
-    # If the leading block raises, the error is recorded (see #leading_error),
-    # on_leading_error is invoked (if given), and the elector stops trying to
-    # acquire leadership -- a fatal startup failure should not loop forever.
     class LeaderElector
-      attr_reader :leader, :leading_error
+      attr_reader :leader
 
       def initialize(
         client:,
@@ -31,8 +27,7 @@ module KrubyController
         renew_deadline: 10,
         retry_period: 2,
         identity: nil,
-        on_stopped_leading: nil,
-        on_leading_error: nil
+        on_stopped_leading: nil
       )
         @client = client
         @lease_name = lease_name
@@ -42,9 +37,7 @@ module KrubyController
         @retry_period = retry_period
         @identity = identity || "#{Socket.gethostname}-#{Process.pid}"
         @on_stopped_leading = on_stopped_leading
-        @on_leading_error = on_leading_error
         @leader = false
-        @leading_error = nil
         @running = false
         @renewal_running = false
         @thread = nil
@@ -67,39 +60,30 @@ module KrubyController
       private
 
       def election_loop
-        while @running
-          unless try_acquire
-            sleep @retry_period
-            next
-          end
+        begin
+          while @running
+            unless try_acquire
+              sleep @retry_period
+              next
+            end
 
-          @leader = true
-          @renewal_running = true
-          renewal_thread = Thread.new { renewal_loop }
-          begin
-            @started_leading_block&.call
-          rescue StandardError => e
-            KrubyController.logger.error("LeaderElector: on_started_leading failed: #{e.message}")
-            @leading_error = e
-            # Stop and join the renewal loop BEFORE invoking external callback
-            # code: the callback (e.g. the manager's shutdown path) may raise,
-            # and we must not leave the renewal thread running and renewing the
-            # lease after the election thread unwinds into ensure.
-            @running = false
+            @leader = true
+            @renewal_running = true
+            renewal_thread = Thread.new { renewal_loop }
+            begin
+              @started_leading_block&.call
+            rescue => e
+              KrubyController.logger.error("LeaderElector: on_started_leading failed: #{e.message}")
+            end
+            renewal_thread.join
             @renewal_running = false
             @leader = false
-            renewal_thread.join
-            @on_leading_error&.call
-            break
+            @on_stopped_leading&.call
+            sleep @retry_period
           end
-          renewal_thread.join
-          @renewal_running = false
-          @leader = false
-          @on_stopped_leading&.call
-          sleep @retry_period
+        ensure
+          release
         end
-      ensure
-        release
       end
 
       def try_acquire

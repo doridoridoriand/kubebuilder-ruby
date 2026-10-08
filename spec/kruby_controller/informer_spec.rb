@@ -2,6 +2,19 @@
 
 InformerGVK = Struct.new(:group, :version, :kind, :resource)
 
+class InformerSpecEventRecorder
+  attr_reader :events
+
+  def initialize
+    @events = []
+    @mutex = Mutex.new
+  end
+
+  def handle(type, obj)
+    @mutex.synchronize { @events << [type, obj] }
+  end
+end
+
 RSpec.describe KrubyController::Cache::Informer do
   let(:gvk) { InformerGVK.new("stable.example.com", "v1", "CronTask", "crontasks") }
   let(:store) { KrubyController::Cache::Store.new }
@@ -56,75 +69,20 @@ RSpec.describe KrubyController::Cache::Informer do
         double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}")
       end
 
-      it "retries the list instead of raising, and stops when the informer is stopped" do
-        allow(informer).to receive(:sleep) # skip the backoff
-        informer.instance_variable_set(:@running, true) # as if started
-        thread = Thread.new { informer.send(:populate) }
-
-        sleep 0.2
-        expect(informer.synced).to be false
-        expect(api_client).to have_received(:build_request).at_least(:twice)
-
-        informer.stop
-        thread.join
-        expect(thread).not_to be_alive
-      end
-    end
-
-    context "when list fails transiently then succeeds" do
-      let(:failed_request) do
-        double("request", run: double("response", success?: false, code: 500, status_message: "ISE", body: "{}"))
-      end
-      let(:ok_request) do
-        double(
-          "request",
-          run: double(
-            "response",
-            success?: true,
-            code: 200,
-            status_message: "OK",
-            body: {
-              "items" => [
-                { "metadata" => { "namespace" => "default", "name" => "a", "resourceVersion" => "100" } }
-              ],
-              "metadata" => { "resourceVersion" => "100" }
-            }.to_json
-          )
-        )
-      end
-
-      it "succeeds on a later attempt and syncs" do
-        allow(api_client).to receive(:build_request).and_return(failed_request, ok_request)
-        allow(informer).to receive(:sleep) # skip the backoff
-        informer.instance_variable_set(:@running, true) # as if started
-
-        informer.send(:populate)
-
-        expect(informer.synced).to be true
-        expect(store.get("default", "a")).to be_a(Hash)
-      end
-    end
-
-    context "when the list keeps failing" do
-      let(:failing_request) do
-        double("request", run: double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}"))
-      end
-
-      it "gives up after the initial List plus 3 retries and records the sync error" do
-        allow(api_client).to receive(:build_request).and_return(failing_request)
+      it "records the sync error after exhausting retries instead of raising" do
         allow(informer).to receive(:interruptible_sleep)
         informer.instance_variable_set(:@running, true)
 
         informer.send(:populate)
 
-        expect(api_client).to have_received(:build_request).exactly(4).times
         expect(informer.synced).to be false
         expect(informer.sync_error).to be_a(KrubyController::Error)
         expect(informer.sync_error.message).to include("403")
+        expect(api_client).to have_received(:build_request).exactly(4).times
       end
 
       it "does not record a sync error when stopped mid-retry" do
-        allow(api_client).to receive(:build_request).and_return(failing_request)
+        allow(api_client).to receive(:build_request).and_return(double("request", run: response))
         allow(informer).to receive(:interruptible_sleep) do
           informer.instance_variable_set(:@running, false) # simulate a stop during backoff
         end
@@ -137,24 +95,90 @@ RSpec.describe KrubyController::Cache::Informer do
       end
     end
 
-    it "never opens the watch while the initial List is still failing" do
-      watch_connects = 0
+    context "when list fails transiently then succeeds" do
+      it "succeeds on a later attempt and syncs" do
+        failed = double(
+          "request",
+          run: double("response", success?: false, code: 500, status_message: "ISE", body: "{}")
+        )
+        ok_body = {
+          "items" => [{ "metadata" => { "namespace" => "default", "name" => "a", "resourceVersion" => "100" } }],
+          "metadata" => { "resourceVersion" => "100" }
+        }.to_json
+        ok = double("request", run: double("response", success?: true, code: 200, status_message: "OK", body: ok_body))
+        allow(api_client).to receive(:build_request).and_return(failed, ok)
+        allow(informer).to receive(:interruptible_sleep)
+        informer.instance_variable_set(:@running, true)
+
+        informer.send(:populate)
+
+        expect(informer.synced).to be true
+        expect(store.get("default", "a")).to be_a(Hash)
+      end
+    end
+
+    context "when re-populated after a stop (restart)" do
+      def make_item(name, rev)
+        { "metadata" => { "namespace" => "default", "name" => name, "resourceVersion" => rev } }
+      end
+
+      def make_list(items, rev)
+        { "items" => items, "metadata" => { "resourceVersion" => rev } }.to_json
+      end
+
+      it "replaces the store and emits the diff, dropping objects deleted while stopped" do
+        deleted = KrubyController::Cache::Delta::DELETED
+        items1 = [make_item("a", "100"), make_item("b", "101")]
+        items2 = [make_item("a", "100")]
+        resp1 = double("response", success?: true, code: 200, body: make_list(items1, "101"))
+        resp2 = double("response", success?: true, code: 200, body: make_list(items2, "105"))
+        allow(api_client).to receive(:build_request)
+          .and_return(double("request", run: resp1), double("request", run: resp2))
+        recorder = InformerSpecEventRecorder.new
+        informer.add_handler(recorder)
+
+        informer.instance_variable_set(:@running, true)
+        informer.send(:populate) # first run: a, b
+        expect(store.get("default", "a")).to be_a(Hash)
+        expect(store.get("default", "b")).to be_a(Hash)
+
+        # Simulate a stop + restart: the store is intact (still a, b).
+        informer.instance_variable_set(:@synced, false)
+        informer.instance_variable_set(:@resource_version, nil)
+
+        informer.send(:populate) # second run: only a (b was deleted while stopped)
+
+        expect(store.get("default", "a")).to be_a(Hash)
+        expect(store.get("default", "b")).to be_nil # deleted while stopped, now dropped
+        expect(recorder.events).to include(
+          [deleted, hash_including("metadata" => hash_including("name" => "b"))]
+        )
+      end
+    end
+  end
+
+  describe "initial List failure lifecycle" do
+    let(:response) do
+      double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}")
+    end
+
+    it "records the sync error and does not wait forever for the watch" do
+      allow(api_client).to receive(:build_request).and_return(double("request", run: response))
+      allow(informer).to receive(:interruptible_sleep)
       fake_watch = instance_double(Kubernetes::Watch)
       allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
-      allow(fake_watch).to receive(:connect) { |_path, &_blk| watch_connects += 1 }
-
-      allow(api_client).to receive(:build_request).and_return(
-        double("request",
-               run: double("response", success?: false, code: 403, status_message: "Forbidden", body: "{}"))
-      )
-      allow(informer).to receive(:interruptible_sleep)
+      watch_started = false
+      allow(fake_watch).to receive(:connect) { watch_started = true }
 
       informer.start
       deadline = Time.now + 5
       sleep 0.05 until informer.sync_error || Time.now >= deadline
 
       expect(informer.synced).to be false
-      expect(watch_connects).to eq(0)
+      expect(informer.sync_error).to be_a(KrubyController::Error)
+      # The watch never started: it waits for the List, which failed.
+      expect(watch_started).to be false
+    ensure
       informer.stop
     end
 
@@ -207,6 +231,147 @@ RSpec.describe KrubyController::Cache::Informer do
       )
 
       expect(ns_informer.send(:list_path_for, cluster_gvk)).to eq("/apis/stable.example.com/v1/clusterthings")
+    end
+  end
+
+  describe "watch relist (stale watch recovery)" do
+    let(:recorder) { InformerSpecEventRecorder.new }
+    let(:informer) { described_class.new(gvk: gvk, store: store, api_client: api_client) }
+    let(:added) { KrubyController::Cache::Delta::ADDED }
+    let(:deleted) { KrubyController::Cache::Delta::DELETED }
+
+    def item(name, rev, namespace: "default")
+      { "metadata" => { "namespace" => namespace, "name" => name, "resourceVersion" => rev } }
+    end
+
+    def list_response(items, rev)
+      double("response", success?: true, code: 200, status_message: "OK",
+                         body: { "items" => items, "metadata" => { "resourceVersion" => rev } }.to_json)
+    end
+
+    def stub_list(responses)
+      requests = responses.map { |resp| double("request", run: resp) }
+      allow(api_client).to receive(:build_request).and_return(*requests, requests.last)
+    end
+
+    def stub_watch(&behavior)
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      paths = []
+      paths_mutex = Mutex.new
+      allow(fake_watch).to receive(:connect) do |path, &block|
+        paths_mutex.synchronize { paths << path }
+        behavior.call(paths_mutex.synchronize { paths.size }, path, block)
+      end
+      paths
+    end
+
+    def wait_until(timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.05 until deadline <= Time.now || yield
+    end
+
+    after { informer.stop }
+
+    it "relists, syncs the store, and reconnects with the fresh resourceVersion after a 410 Gone" do
+      stub_list([
+                  list_response([item("a", "100"), item("b", "101")], "101"),
+                  list_response([item("a", "100"), item("c", "102")], "102")
+                ])
+      paths = stub_watch do |size, _path, _block|
+        raise KrubyController::Error, "410 Gone" if size == 1
+
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.add_handler(recorder)
+      informer.start
+      # Waiting for the second connection guarantees the first relist fully
+      # completed: the store was replaced, the ADDED/DELETED diff events were
+      # emitted to handlers, and @resource_version advanced to 102. Waiting on
+      # the store alone would only prove `replace` ran, not that the events
+      # were delivered.
+      wait_until { paths.size >= 2 }
+
+      expect(store.get("default", "a")).to be_a(Hash)
+      expect(store.get("default", "c")).to be_a(Hash)
+      expect(store.get("default", "b")).to be_nil
+      expect(paths.size).to be >= 2
+      expect(paths.last).to include("resourceVersion=102")
+      expect(recorder.events).to include(
+        [added, hash_including("metadata" => hash_including("name" => "c"))]
+      )
+      expect(recorder.events).to include(
+        [deleted, hash_including("metadata" => hash_including("name" => "b"))]
+      )
+    end
+
+    it "delivers all relist events to surviving handlers even when one handler raises" do
+      raising = Class.new do
+        def handle(_type, _obj)
+          raise "handler boom"
+        end
+      end.new
+      recorder = InformerSpecEventRecorder.new
+
+      stub_list([
+                  list_response([item("a", "100"), item("b", "101")], "101"),
+                  list_response([item("a", "100"), item("c", "102")], "102")
+                ])
+      paths = stub_watch do |size, _path, _block|
+        raise KrubyController::Error, "410 Gone" if size == 1
+
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.add_handler(raising)
+      informer.add_handler(recorder)
+      informer.start
+      wait_until { paths.size >= 2 }
+
+      # The store snapshot is already committed by the first relist, so a
+      # retry would compare identical snapshots and emit nothing. The recorder
+      # must still receive every diff event despite the first handler raising.
+      names = recorder.events.map { |(_type, obj)| obj.dig("metadata", "name") }
+      expect(names).to include("c")
+      expect(names).to include("b")
+    end
+
+    it "relists when the watch stream closes cleanly" do
+      stub_list([list_response([item("a", "100")], "100")])
+      paths = stub_watch do |size, _path, _block|
+        if size == 1
+          # first watch closes cleanly (no error)
+        else
+          sleep 0.05
+          raise KrubyController::Error, "closed"
+        end
+      end
+
+      informer.start
+      wait_until { paths.size >= 2 }
+
+      expect(paths.size).to be >= 2
+      expect(store.get("default", "a")).to be_a(Hash)
+    end
+
+    it "retries a failed relist until the list succeeds" do
+      stub_list([
+                  list_response([item("a", "100")], "100"),
+                  double("response", success?: false, code: 500, status_message: "ISE", body: "{}"),
+                  list_response([item("a", "100"), item("d", "103")], "103")
+                ])
+      stub_watch do |_size, _path, _block|
+        sleep 0.05
+        raise KrubyController::Error, "410 Gone"
+      end
+
+      informer.start
+      wait_until { store.get("default", "d") }
+
+      expect(store.get("default", "d").dig("metadata", "resourceVersion")).to eq("103")
     end
   end
 end

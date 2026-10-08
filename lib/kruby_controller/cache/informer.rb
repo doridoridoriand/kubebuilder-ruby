@@ -7,11 +7,12 @@ module KrubyController
     class Informer
       attr_reader :store, :gvk, :synced
 
-      def initialize(gvk:, store:, api_client:, handlers: [])
+      def initialize(gvk:, store:, api_client:, handlers: [], namespace: nil)
         @gvk = gvk
         @store = store
         @api_client = api_client
         @handlers = handlers
+        @namespace = namespace
         @resource_version = nil
         @running = false
         @started = false
@@ -60,7 +61,7 @@ module KrubyController
         items.each { |item| @store.add(Delta::ADDED, item) }
         @resource_version = resp.dig("metadata", "resourceVersion")
         @synced = true
-      rescue => e
+      rescue StandardError => e
         KrubyController.logger.error("Informer populate failed: #{e.message}")
         raise
       end
@@ -77,7 +78,7 @@ module KrubyController
               @store.add(type, obj)
               @handlers.each { |h| h.handle(type, obj) }
             end
-          rescue => e
+          rescue StandardError => e
             KrubyController.logger.warn("Watch disconnected: #{e.message}")
             sleep 1
             retry if @running
@@ -85,12 +86,21 @@ module KrubyController
         end
       end
 
+      # Namespaces the list path only for namespaced resources; cluster-scoped
+      # resources stay cluster-wide even when a namespace is configured.
       def list_path_for(gvk)
-        if gvk.group.empty?
-          "/api/#{gvk.version}/#{gvk.resource}"
-        else
-          "/apis/#{gvk.group}/#{gvk.version}/#{gvk.resource}"
-        end
+        prefix = if gvk.group.empty?
+                   "/api/#{gvk.version}"
+                 else
+                   "/apis/#{gvk.group}/#{gvk.version}"
+                 end
+        scope = if @namespace && gvk.respond_to?(:namespaced?) && gvk.namespaced?
+                  "/namespaces/#{@namespace}"
+                else
+                  ""
+                end
+
+        "#{prefix}#{scope}/#{gvk.resource}"
       end
 
       def watch_path_for(gvk, rv)

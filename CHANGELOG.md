@@ -19,4 +19,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Leader Election (skeleton)
 - Finalizer, OwnerReference, Status helpers (skeleton)
 - CRD Generator (skeleton)
-- CLI: `init` and `create api` (skeleton)
+- CLI: `init` and `create api` scaffolding (Phase 3)

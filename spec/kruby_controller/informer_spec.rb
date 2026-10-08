@@ -81,6 +81,45 @@ RSpec.describe KrubyController::Cache::Informer do
         expect(api_client).to have_received(:build_request).exactly(4).times
       end
     end
+
+    context "when re-populated after a stop (restart)" do
+      def make_item(name, rev)
+        { "metadata" => { "namespace" => "default", "name" => name, "resourceVersion" => rev } }
+      end
+
+      def make_list(items, rev)
+        { "items" => items, "metadata" => { "resourceVersion" => rev } }.to_json
+      end
+
+      it "replaces the store and emits the diff, dropping objects deleted while stopped" do
+        deleted = KrubyController::Cache::Delta::DELETED
+        items1 = [make_item("a", "100"), make_item("b", "101")]
+        items2 = [make_item("a", "100")]
+        resp1 = double("response", success?: true, code: 200, body: make_list(items1, "101"))
+        resp2 = double("response", success?: true, code: 200, body: make_list(items2, "105"))
+        allow(api_client).to receive(:build_request)
+          .and_return(double("request", run: resp1), double("request", run: resp2))
+        recorder = InformerSpecEventRecorder.new
+        informer.add_handler(recorder)
+
+        informer.instance_variable_set(:@running, true)
+        informer.send(:populate) # first run: a, b
+        expect(store.get("default", "a")).to be_a(Hash)
+        expect(store.get("default", "b")).to be_a(Hash)
+
+        # Simulate a stop + restart: the store is intact (still a, b).
+        informer.instance_variable_set(:@synced, false)
+        informer.instance_variable_set(:@resource_version, nil)
+
+        informer.send(:populate) # second run: only a (b was deleted while stopped)
+
+        expect(store.get("default", "a")).to be_a(Hash)
+        expect(store.get("default", "b")).to be_nil # deleted while stopped, now dropped
+        expect(recorder.events).to include(
+          [deleted, hash_including("metadata" => hash_including("name" => "b"))]
+        )
+      end
+    end
   end
 
   describe "initial List failure lifecycle" do

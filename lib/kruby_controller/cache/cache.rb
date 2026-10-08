@@ -3,8 +3,9 @@
 module KrubyController
   module Cache
     class SharedCache
-      def initialize(kube_config: nil)
+      def initialize(kube_config: nil, namespace: nil)
         @kube_config = kube_config
+        @namespace = namespace
         @informers = {}
         @mutex = Mutex.new
       end
@@ -14,7 +15,7 @@ module KrubyController
           return @informers[gvk.to_s] if @informers.key?(gvk.to_s)
 
           store = Store.new
-          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [])
+          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [], namespace: @namespace)
           @informers[gvk.to_s] = informer
           informer
         end

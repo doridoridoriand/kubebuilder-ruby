@@ -95,4 +95,27 @@ RSpec.describe KrubyController::Manager do
       expect(informer.instance_variable_get(:@namespace)).to eq("team-a")
     end
   end
+
+  describe "startup failure (cache cannot sync)" do
+    it "stops components and raises when the cache cannot sync (no leader election)" do
+      manager = described_class.new(leader_elect: false)
+      expect(manager.cache).to receive(:wait_for_sync).and_raise(KrubyController::Error.new("list failed 403"))
+      expect(manager.cache).to receive(:stop)
+
+      expect { manager.start }.to raise_error(KrubyController::Error, /403/)
+    end
+
+    it "records the startup error and signals stop under leader election" do
+      manager = described_class.new(leader_elect: true)
+      err = KrubyController::Error.new("sync boom")
+      allow(manager).to receive(:start_and_sync).and_raise(err)
+      manager.instance_variable_set(:@leader_elector, double("elector"))
+
+      expect { manager.send(:start_leading) }.to raise_error(KrubyController::Error, /sync boom/)
+      expect(manager.instance_variable_get(:@startup_error)).to be(err)
+      # The stop channel was signaled so Manager#start (blocked in receive)
+      # unblocks and can fail with the recorded error.
+      expect(manager.instance_variable_get(:@stop_channel).receive).to eq(:stopped)
+    end
+  end
 end

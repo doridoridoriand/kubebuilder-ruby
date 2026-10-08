@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
-BuilderSpecCronTaskGVK = KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask", resource: "crontasks")
+BuilderSpecCronTaskGVK = KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask",
+                                                  resource: "crontasks")
 BuilderSpecJobGVK = KrubyController::GVK.new(group: "batch", version: "v1", kind: "Job", resource: "jobs")
 BuilderSpecConfigMapGVK = KrubyController::GVK.new(group: "", version: "v1", kind: "ConfigMap", resource: "configmaps")
 
@@ -114,7 +115,8 @@ RSpec.describe KrubyController::Controller do
     it "reconciles the object itself when it changes" do
       controller.start
       handlers_for(BuilderSpecCronTaskGVK).each do |h|
-        h.handle(KrubyController::Cache::Delta::ADDED, { "metadata" => { "namespace" => "default", "name" => "cron-a" } })
+        h.handle(KrubyController::Cache::Delta::ADDED,
+                 { "metadata" => { "namespace" => "default", "name" => "cron-a" } })
       end
 
       expect(wait_until_reconciled(["default/cron-a"])).to include("default/cron-a")
@@ -123,7 +125,8 @@ RSpec.describe KrubyController::Controller do
 
   describe "owns:" do
     let(:controller) do
-      described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK, owns: [BuilderSpecJobGVK])
+      described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                          owns: [BuilderSpecJobGVK])
     end
 
     it "registers an EnqueuedOwner handler on each owned gvk informer" do
@@ -279,15 +282,197 @@ RSpec.describe KrubyController::Controller do
       controller.start
       handlers_for(BuilderSpecCronTaskGVK).each do |h|
         h.handle(KrubyController::Cache::Delta::ADDED,
-                 { "metadata" => { "namespace" => "default", "name" => "keep", "labels" => { "managed-by" => "cron" } } })
+                 { "metadata" => { "namespace" => "default", "name" => "keep",
+                                   "labels" => { "managed-by" => "cron" } } })
         h.handle(KrubyController::Cache::Delta::ADDED,
-                 { "metadata" => { "namespace" => "default", "name" => "drop", "labels" => { "managed-by" => "other" } } })
+                 { "metadata" => { "namespace" => "default", "name" => "drop",
+                                   "labels" => { "managed-by" => "other" } } })
       end
 
       reconciled = wait_until_reconciled(["default/keep"])
       expect(reconciled).to include("default/keep")
       sleep 0.2
       expect(reconciler.reconciled_names).not_to include("default/drop")
+    end
+  end
+
+  describe "reconcile error backoff" do
+    let(:limiter) { KrubyController::Queue::ExponentialBackoffRateLimiter.new(base: 0.05, max: 0.5) }
+
+    def enqueue_failure(name)
+      handlers_for(BuilderSpecCronTaskGVK).each do |h|
+        h.handle(KrubyController::Cache::Delta::ADDED, { "metadata" => { "namespace" => "default", "name" => name } })
+      end
+    end
+
+    def poll_until(timeout: 3)
+      deadline = Time.now + timeout
+      sleep 0.01 until deadline <= Time.now || yield
+    end
+
+    it "requeues a raising reconcile with growing exponential backoff" do
+      failing = Class.new(KrubyController::Reconciler) do
+        def initialize
+          super
+          @attempts = []
+          @mutex = Mutex.new
+        end
+
+        def reconcile(_request)
+          @mutex.synchronize { @attempts << Process.clock_gettime(Process::CLOCK_MONOTONIC) }
+          raise "boom"
+        end
+
+        def attempts
+          @mutex.synchronize { @attempts.dup }
+        end
+      end.new
+      controller = described_class.new(
+        reconciler: failing, cache: cache, for_gvk: BuilderSpecCronTaskGVK, rate_limiter: limiter
+      )
+      controller.start
+      begin
+        enqueue_failure("fail-1")
+        poll_until { failing.attempts.size >= 3 && limiter.failures("default/fail-1") >= 3 }
+
+        t0, t1, t2 = failing.attempts
+        expect(t1 - t0).to be >= 0.04 # first backoff: base (50ms)
+        expect(t2 - t1).to be >= 0.09 # second backoff: 2 * base (100ms)
+        expect(limiter.failures("default/fail-1")).to be >= 3
+      ensure
+        controller.stop
+      end
+    end
+
+    it "resets the backoff counter after a successful reconcile" do
+      seen = 0
+      flaky = Class.new(KrubyController::Reconciler) do
+        define_method(:reconcile) do |_request|
+          seen += 1
+          raise "boom" if seen < 3
+
+          KrubyController::Result.ok
+        end
+      end.new
+      controller = described_class.new(
+        reconciler: flaky, cache: cache, for_gvk: BuilderSpecCronTaskGVK, rate_limiter: limiter
+      )
+      controller.start
+      begin
+        enqueue_failure("flaky-1")
+        poll_until { seen >= 3 && limiter.failures("default/flaky-1").zero? }
+
+        expect(seen).to eq(3)
+        expect(limiter.failures("default/flaky-1")).to eq(0)
+      ensure
+        controller.stop
+      end
+    end
+
+    it "treats a result carrying an error as a failure (rate-limited requeue)" do
+      r = Class.new(KrubyController::Reconciler) do
+        def reconcile(_request)
+          KrubyController::Result.requeue(error: StandardError.new("transient"))
+        end
+      end.new
+      controller = described_class.new(reconciler: r, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                                       rate_limiter: limiter)
+      controller.start
+      begin
+        enqueue_failure("err-1")
+        poll_until { limiter.failures("default/err-1") >= 2 }
+
+        expect(limiter.failures("default/err-1")).to be >= 2
+      ensure
+        controller.stop
+      end
+    end
+
+    it "requeues a plain Requeue immediately without touching the backoff counter" do
+      seen = 0
+      r = Class.new(KrubyController::Reconciler) do
+        define_method(:reconcile) do |_request|
+          seen += 1
+          seen < 3 ? KrubyController::Result.requeue : KrubyController::Result.ok
+        end
+      end.new
+      controller = described_class.new(reconciler: r, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                                       rate_limiter: limiter)
+      controller.start
+      begin
+        enqueue_failure("rq-1")
+        poll_until { seen >= 3 }
+
+        expect(seen).to eq(3)
+        expect(limiter.failures("default/rq-1")).to eq(0)
+      ensure
+        controller.stop
+      end
+    end
+
+    describe "#handle_result (forget on successful requeue)" do
+      let(:hr_controller) do
+        described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                            rate_limiter: limiter)
+      end
+      let(:request) { KrubyController::Request.new(namespace: "default", name: "hr") }
+      let(:key) { "default/hr" }
+
+      it "resets the failure streak on an error-free RetryAfter" do
+        2.times { limiter.backoff(key) }
+        expect(limiter.failures(key)).to eq(2)
+
+        hr_controller.send(:handle_result, KrubyController::Result.retry_after(1), request, key)
+
+        expect(limiter.failures(key)).to eq(0)
+      end
+
+      it "resets the failure streak on an error-free Requeue" do
+        2.times { limiter.backoff(key) }
+
+        hr_controller.send(:handle_result, KrubyController::Result.requeue, request, key)
+
+        expect(limiter.failures(key)).to eq(0)
+      end
+
+      it "rate-limits a RetryAfter that carries an error" do
+        2.times { limiter.backoff(key) }
+
+        hr_controller.send(
+          :handle_result,
+          KrubyController::Result.retry_after(1, error: StandardError.new("boom")), request, key
+        )
+
+        expect(limiter.failures(key)).to eq(3)
+      end
+    end
+
+    describe "#clear_failure_on_shutdown?" do
+      let(:c) do
+        described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,
+                            rate_limiter: limiter)
+      end
+
+      it "clears the history for a clean Ok" do
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.ok)).to be(true)
+      end
+
+      it "clears the history for an error-free RetryAfter / Requeue" do
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.retry_after(1))).to be(true)
+        expect(c.send(:clear_failure_on_shutdown?, false, KrubyController::Result.requeue)).to be(true)
+      end
+
+      it "does NOT clear when the reconcile raised" do
+        expect(c.send(:clear_failure_on_shutdown?, true, KrubyController::Result.ok)).to be(false)
+      end
+
+      it "does NOT clear when the result carries an error" do
+        requeue_err = KrubyController::Result.requeue(error: StandardError.new("x"))
+        retry_err = KrubyController::Result.retry_after(1, error: StandardError.new("x"))
+
+        expect(c.send(:clear_failure_on_shutdown?, false, requeue_err)).to be(false)
+        expect(c.send(:clear_failure_on_shutdown?, false, retry_err)).to be(false)
+      end
     end
   end
 end
@@ -299,12 +484,12 @@ RSpec.describe KrubyController::Builder::ControllerBuilder do
 
   it "wires owns / watches / predicate / max_concurrent end to end (fluent API)" do
     controller = manager
-      .for(BuilderSpecCronTaskGVK)
-      .owns(BuilderSpecJobGVK)
-      .watches(BuilderSpecConfigMapGVK, predicate: ->(o) { true })
-      .with_max_concurrent_reconciles(3)
-      .with_predicate(->(o) { true })
-      .complete_with(reconciler)
+                 .for(BuilderSpecCronTaskGVK)
+                 .owns(BuilderSpecJobGVK)
+                 .watches(BuilderSpecConfigMapGVK, predicate: ->(_o) { true })
+                 .with_max_concurrent_reconciles(3)
+                 .with_predicate(->(_o) { true })
+                 .complete_with(reconciler)
 
     expect(controller.for_gvk).to eq(BuilderSpecCronTaskGVK)
     expect(controller.instance_variable_get(:@max_concurrent)).to eq(3)
@@ -339,10 +524,10 @@ RSpec.describe KrubyController::Builder::ControllerBuilder do
 
     it "normalizes owned/watched CRD classes into GVKs before registration" do
       controller = manager
-        .for(BuilderSpecCronTaskGVK)
-        .owns(job_class)
-        .watches(configmap_class, predicate: ->(o) { true })
-        .complete_with(reconciler)
+                   .for(BuilderSpecCronTaskGVK)
+                   .owns(job_class)
+                   .watches(configmap_class, predicate: ->(_o) { true })
+                   .complete_with(reconciler)
 
       owns = controller.instance_variable_get(:@owns)
       watch_gvks = controller.instance_variable_get(:@watches).map { |w| w[:gvk] }
@@ -357,9 +542,9 @@ RSpec.describe KrubyController::Builder::ControllerBuilder do
 
     it "registers informers keyed by the normalized GVKs" do
       controller = manager
-        .for(BuilderSpecCronTaskGVK)
-        .owns(job_class)
-        .complete_with(reconciler)
+                   .for(BuilderSpecCronTaskGVK)
+                   .owns(job_class)
+                   .complete_with(reconciler)
 
       controller.start
       expect(informers.keys).to contain_exactly(BuilderSpecCronTaskGVK.to_s, "batch/v1, Kind=Job")

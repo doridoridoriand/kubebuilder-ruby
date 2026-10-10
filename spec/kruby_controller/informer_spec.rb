@@ -182,6 +182,36 @@ RSpec.describe KrubyController::Cache::Informer do
       informer.stop
     end
 
+    it "does not start the watch until the retried List succeeds" do
+      # The first List attempt fails and the second succeeds. The watch must
+      # not start while the List is still retrying; it connects only after the
+      # List has actually succeeded, so it cannot race a retrying List.
+      calls = 0
+      allow(informer).to receive(:fetch_list) do
+        calls += 1
+        raise KrubyController::Error, "transient list failure" if calls == 1
+
+        { "items" => [], "metadata" => { "resourceVersion" => "100" } }
+      end
+      allow(informer).to receive(:interruptible_sleep)
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      synced_when_connected = []
+      allow(fake_watch).to receive(:connect) { synced_when_connected << informer.synced }
+
+      informer.start
+      deadline = Time.now + 5
+      sleep 0.05 until informer.synced || Time.now >= deadline
+      deadline = Time.now + 2
+      sleep 0.05 until synced_when_connected.any? || Time.now >= deadline
+
+      expect(informer.synced).to be true
+      # Every time the watch connected, the List had already succeeded.
+      expect(synced_when_connected).to all(be(true))
+    ensure
+      informer.stop
+    end
+
     it "clears a stale sync error before a new run" do
       informer.instance_variable_set(:@sync_error, KrubyController::Error.new("stale 403"))
       allow(informer).to receive(:populate) # no-op: do not re-set sync_error
@@ -191,6 +221,30 @@ RSpec.describe KrubyController::Cache::Informer do
       expect(informer.sync_error).to be_nil
     ensure
       informer.stop
+    end
+  end
+
+  describe "#stop (bounded join)" do
+    it "does not block longer than the join timeout when a worker thread is stuck" do
+      stuck = Thread.new { sleep 120 }
+      start = Time.now
+      informer.send(:join_bounded, stuck, timeout: 0.2)
+      elapsed = Time.now - start
+
+      expect(elapsed).to be < 5
+      # The stuck thread is left running (it will end when its stream closes);
+      # we do not kill it here, only to keep the spec tidy.
+      expect(stuck.alive?).to be true
+    ensure
+      stuck.kill if stuck&.alive?
+    end
+
+    it "returns immediately for an already-finished thread" do
+      done = Thread.new { nil }
+      done.join
+      start = Time.now
+      informer.send(:join_bounded, done, timeout: 0.2)
+      expect(Time.now - start).to be < 0.5
     end
   end
 

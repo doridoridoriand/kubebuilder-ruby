@@ -42,8 +42,8 @@ module KrubyController
         @running = false
         @started = false
         @synced = false
-        @populate_thread&.join
-        @watch_thread&.join
+        join_bounded(@populate_thread)
+        join_bounded(@watch_thread)
       end
 
       def add_handler(handler)
@@ -51,6 +51,12 @@ module KrubyController
       end
 
       private
+
+      # How long #stop waits for a worker thread to exit before giving up.
+      # The watch stream (Typhoeus) exposes no cancellation API, so a stream
+      # that stays open cannot be interrupted; bounding the join keeps
+      # cleanup from blocking the startup-error path indefinitely.
+      STOP_JOIN_TIMEOUT = 10
 
       POPULATE_INITIAL_BACKOFF = 1.0
       POPULATE_MAX_BACKOFF = 30.0
@@ -112,6 +118,20 @@ module KrubyController
           sleep step
           slept += step
         end
+      end
+
+      # Joins +thread+ for at most +timeout+ seconds. Returns once the thread
+      # has exited; if it is still alive (e.g. blocked in a watch stream that
+      # cannot be canceled), logs a warning and returns so the caller is not
+      # blocked indefinitely.
+      def join_bounded(thread, timeout: STOP_JOIN_TIMEOUT)
+        return if thread.nil?
+        return unless thread.join(timeout).nil?
+
+        KrubyController.logger.warn(
+          "Informer #{@gvk}: a worker thread did not exit within #{timeout}s; " \
+          "proceeding (it will end when its stream closes)"
+        )
       end
 
       def fetch_list

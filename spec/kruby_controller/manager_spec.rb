@@ -105,6 +105,14 @@ RSpec.describe KrubyController::Manager do
       expect { manager.start }.to raise_error(KrubyController::Error, /403/)
     end
 
+    it "stops components and raises when the cache times out without syncing (no leader election)" do
+      manager = described_class.new(leader_elect: false)
+      expect(manager.cache).to receive(:wait_for_sync).and_return(false)
+      expect(manager.cache).to receive(:stop)
+
+      expect { manager.start }.to raise_error(KrubyController::Error, /did not sync/)
+    end
+
     it "records the startup error and signals stop under leader election" do
       manager = described_class.new(leader_elect: true)
       err = KrubyController::Error.new("sync boom")

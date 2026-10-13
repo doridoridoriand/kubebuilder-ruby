@@ -15,6 +15,7 @@ module KrubyController
 
     def ==(other)
       return false unless other.is_a?(Request)
+
       @namespace == other.namespace && @name == other.name
     end
     alias eql? ==
@@ -24,7 +25,7 @@ module KrubyController
     end
 
     def inspect
-      "#<Request #{@namespaced_name}>"
+      "#<Request #{namespaced_name}>"
     end
 
     class NamespacedName
@@ -45,12 +46,13 @@ module KrubyController
 
       def ==(other)
         return false unless other.is_a?(NamespacedName)
+
         @namespace == other.namespace && @name == other.name
       end
       alias eql? ==
 
       def inspect
-        "NamespacedName(#{to_s})"
+        "NamespacedName(#{self})"
       end
     end
   end

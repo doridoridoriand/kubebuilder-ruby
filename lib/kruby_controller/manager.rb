@@ -146,7 +146,10 @@ module KrubyController
     def start_and_sync
       start_controllers
       @cache.start
-      @cache.wait_for_sync
+      # A cache that is not synced within the timeout is just as fatal as one
+      # that fails outright: fail startup (stopping the components we just
+      # started) instead of running controllers against an empty/stale cache.
+      raise KrubyController::Error, "Manager: cache did not sync within the timeout" unless @cache.wait_for_sync
     rescue StandardError => e
       # A cache that cannot sync is fatal: stop the components we just
       # started and let the error propagate (Manager#start fails with it).

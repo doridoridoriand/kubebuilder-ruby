@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "timeout"
+
 class GvkSpecCronTaskReconciler < KrubyController::Reconciler
   def reconcile(_request)
     KrubyController::Result.ok
@@ -124,6 +126,55 @@ RSpec.describe KrubyController::Manager do
       # The stop channel was signaled so Manager#start (blocked in receive)
       # unblocks and can fail with the recorded error.
       expect(manager.instance_variable_get(:@stop_channel).receive).to eq(:stopped)
+    end
+
+    it "propagates exhausted List retries through leader election and releases the lease" do
+      manager = described_class.new(leader_elect: true, retry_period: 0.01)
+      lease = Kubernetes::V1Lease.build_from_hash(
+        metadata: { name: "test-lock", namespace: "kube-system" },
+        spec: { leaseDurationSeconds: 15 }
+      )
+      client = double("coordination client", read_namespaced_lease: lease, replace_namespaced_lease: lease)
+      allow(manager).to receive(:coordination_client).and_return(client)
+      allow(manager).to receive(:setup_signal_handlers)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      informer = manager.cache.register(gvk: KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget"))
+      error = KrubyController::Error.new("List failed (HTTP 403)")
+      allow(informer).to receive(:fetch_list).and_raise(error)
+      allow(informer).to receive(:interruptible_sleep)
+
+      expect { Timeout.timeout(3) { manager.start } }.to raise_error(KrubyController::Error) do |raised|
+        expect(raised).to be(error)
+      end
+
+      expect(informer).to have_received(:fetch_list).exactly(4).times
+      expect(informer.synced).to be false
+      expect(manager.leader?).to be false
+      expect(lease.spec.holder_identity).to be_nil
+      elector = manager.instance_variable_get(:@leader_elector)
+      expect(elector.instance_variable_get(:@thread).alive?).to be false
+    ensure
+      manager&.stop
+    end
+
+    it "propagates a cache sync timeout through leader election and stops controllers" do
+      manager = described_class.new(leader_elect: true, retry_period: 0.01)
+      lease = Kubernetes::V1Lease.build_from_hash(metadata: {}, spec: { leaseDurationSeconds: 15 })
+      client = double("coordination client", read_namespaced_lease: lease, replace_namespaced_lease: lease)
+      allow(manager).to receive(:coordination_client).and_return(client)
+      allow(manager).to receive(:setup_signal_handlers)
+      controller = instance_double(KrubyController::Controller, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+      allow(manager.cache).to receive(:wait_for_sync).and_return(false)
+
+      expect { Timeout.timeout(3) { manager.start } }.to raise_error(KrubyController::Error, /did not sync/)
+
+      expect(controller).to have_received(:start).once
+      expect(controller).to have_received(:stop).at_least(:once)
+      expect(manager.leader?).to be false
+      expect(lease.spec.holder_identity).to be_nil
+    ensure
+      manager&.stop
     end
   end
 end

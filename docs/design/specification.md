@@ -14,7 +14,7 @@
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
-| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加。レビュー対応: EventRecorder を events.k8s.io/v1 スキーマ準拠に訂正、predicate の互換契約を明示化、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加。レビュー対応: EventRecorder を events.k8s.io/v1 スキーマ準拠に訂正、predicate の互換契約を明示化、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持。再レビュー対応: `/readyz` をスタンバイ Ready 既定に変更 (`ready_gate: :leader` は Recreate 戦略前提)、merge-patch への限定、webhook 例外と明示拒否の分離、定期 resync を predicate 適用前配信に変更 |
 
 ---
 
@@ -78,7 +78,7 @@ manager.start  # blocks
 | F-12 | 依存の自動注入 | **MUST** | Reconciler へ client / cache / api_client / logger / recorder を Manager が注入 (Phase 5) |
 | F-13 | 競合検知つき書き込み | **SHOULD** | resourceVersion による楽観的排他制御、409 (conflict) の再取得リトライ (Phase 5) |
 | F-14 | EventRecorder | **SHOULD** | events.k8s.io/v1 の Kubernetes Events 送出 (Phase 7) |
-| F-15 | Health Probe | **SHOULD** | `/healthz` (生存) / `/readyz` (cache sync + リーダー状態) エンドポイント (Phase 7) |
+| F-15 | Health Probe | **SHOULD** | `/healthz` (生存) / `/readyz` (cache sync、オプションでリーダー状態) エンドポイント (Phase 7) |
 | F-16 | 定期 Resync | **SHOULD** | watch 切断に依らない定期的な再同期 (既定 10h, Phase 6) |
 | F-17 | Predicate 拡張 | **SHOULD** | old/new 付き Update イベント、事前定義 predicate (GenerationChanged 等) (Phase 6) |
 | F-18 | Server-side Selector | **SHOULD** | List/Watch に labelSelector / fieldSelector を渡す (Phase 6) |
@@ -247,8 +247,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-15 |
 | 説明 | liveness / readiness 用 HTTP エンドポイント |
-| 仕様 | `/healthz` は常時 200 (プロセス生存)。`/readyz` は全 informer synced かつ (`leader_elect: false` またはリーダー取得済み) で 200、それ以外 503 |
-| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081")`。nil で無効 |
+| 仕様 | `/healthz` は常時 200 (プロセス生存)。`/readyz` は既定「全 informer synced」で 200 (リーダー非取得のスタンバイも Ready — RollingUpdate と両立)。`ready_gate: :leader` で「リーダー取得済みのみ 200」に変更可 (その場合は Deployment を Recreate 戦略にする必要がある) |
+| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081", ready_gate: :default | :leader)`。nil で無効 |
 
 #### FR-16: 定期 Resync
 
@@ -256,7 +256,7 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-16 |
 | 説明 | watch 切断に依らない定期的な再同期 (controller-runtime SyncPeriod 相当) |
-| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに、キャッシュ済みの全オブジェクトを合成 delta として handler に再配信する (API List なし。resourceVersion 変化の有無に依らず再配信)。watch 切断時の relist (新鮮な List + 差分配信) は従来どおり |
+| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに、キャッシュ済みの全オブジェクトを合成 delta として handler に再配信する (API List なし。resourceVersion 変化の有無に依らず再配信)。合成 delta は predicate 適用前に配信する。watch 切断時の relist (新鮮な List + 差分配信) は従来どおり |
 | 制約 | 配信負荷はオブジェクト数に比例する (API 負荷ではない)。大規模キャッシュでは resync_period の引き上げを推奨 |
 
 #### FR-17: Predicate 拡張
@@ -274,7 +274,7 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-18 |
 | 説明 | Informer の List/Watch に labelSelector / fieldSelector を渡す |
-| 仕様 | `register(gvk:, label_selector:, field_selector:)` → List/Watch URL に付与。relist / 定期 resync も同一条件 |
+| 仕様 | `register(gvk:, label_selector:, field_selector:)` → List/Watch URL に付与。watch 切断時の relist も同一条件 (定期 resync は既存ストアの再配信であり再取得は行わない) |
 | 制約 | ストアは「セレクタに合致する集合」を保持。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ) |
 
 #### FR-19: CRD DSL 検証制約
@@ -301,7 +301,7 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-21 |
 | 説明 | admission webhook の受信・応答 (旧 O-01 昇格) |
-| 仕様 | DSL で validate / mutate 登録、`AdmissionReview` (admission.k8s.io/v1) 受信 → `AdmissionResponse` 応答、TLS、`kruby-controller create webhook` コマンド |
+| 仕様 | DSL で validate / mutate 登録、`AdmissionReview` (admission.k8s.io/v1) 受信 → `AdmissionResponse` 応答、TLS、`kruby-controller create webhook` コマンド。明示的な検証 NG は `allowed: false` + status、ハンドラ例外は HTTP 5xx で応答し failurePolicy に委ねる |
 | 制約 | failurePolicy (Fail 既定 / Ignore)。TLS 取得方式は未確定 (設計書 Q2) |
 
 #### FR-22: Conversion Webhook

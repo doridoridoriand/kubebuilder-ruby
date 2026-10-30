@@ -13,7 +13,7 @@
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
-| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新。レビュー対応: events.k8s.io/v1 のフィールド名訂正 (regarding / note / reportingController / eventTime)、predicate 互換契約の明示化 (arity 判定の廃止)、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新。レビュー対応: events.k8s.io/v1 のフィールド名訂正 (regarding / note / reportingController / eventTime)、predicate 互換契約の明示化 (arity 判定の廃止)、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持。再レビュー対応: handler の新形式判定を `method(:handle).parameters` に変更 (2 引数互換を維持)、`/readyz` をスタンバイ Ready 既定に変更 (`ready_gate: :leader` は Recreate 戦略前提)、merge-patch への限定 (json-patch は operations 別契約で将来対応)、webhook 例外 (HTTP 5xx) と明示拒否 (`allowed: false`) の分離、定期 resync を predicate 適用前配信に変更、events v1 必須フィールドの明記 |
 
 ---
 
@@ -1148,7 +1148,7 @@ class KrubyController::Client::ControllerClient
   # --- write (ApiClient#build_request で直接構築) ---
   def create(obj)                 # POST collection path
   def update(obj)                 # PUT object path。409 → 再取得 → 最大 5 回 (F-13)
-  def patch(obj, type: :merge)    # PATCH。type: :merge (merge-patch+json) | :json (json-patch+json)。ボディに metadata.resourceVersion を含める (競合検知)
+  def patch(obj)                  # PATCH merge-patch+json。ボディに metadata.resourceVersion を含める (競合検知)。json-patch は Phase 5 対象外 (§2.12.3 参照)
   def delete(obj)                 # DELETE object path
   def patch_status(obj, status_patch = nil)  # PATCH {object_path}/status (merge-patch)
 end
@@ -1180,7 +1180,7 @@ Manager#add
 | 挙動 | 設計 |
 |---|---|
 | update | obj の `metadata.resourceVersion` を伴って PUT。409 Conflict → サーバーから再取得 → 再 PUT。最大 5 回、上限で `KrubyController::ConflictError` を raise |
-| patch / patch_status | merge-patch ボディに `metadata.resourceVersion` を含める (キャッシュ / 直前取得の値)。apiserver は適用後の RV を検証し、不一致を 409 として返すため、merge-patch でも競合検知が効く。409 → 再取得 → 再適用 (最大 5 回) |
+| patch / patch_status | merge-patch ボディに `metadata.resourceVersion` を含める (キャッシュ / 直前取得の値)。apiserver は適用後の RV を検証し、不一致を 409 として返すため、merge-patch でも競合検知が効く。409 → 再取得 → 再適用 (最大 5 回)。Phase 5 では merge-patch のみを提供し、json-patch は対象外とする (JSON Patch はオブジェクト本文ではなく operations 配列を要求するため、同じ本文への RV 追加は不正リクエストになる。将来提供する場合は `patch_json(obj, operations)` として契約を分け、競合検知は `/metadata/resourceVersion` への `test` 操作で定義する) |
 | 409 リトライの位置づけ | reconcile のエラーにはしない (ControllerClient 内で完結)。上限超過のみエラー化 → Controller の指数バックオフに自然合流 |
 
 注意: 全体 PUT の再適用は、再取得後のオブジェクトを送信するため、リトライ間の同時更新を握り潰しうる。merge-patch は対象フィールドのみ更新するためこのリスクが低く、かつ RV による競合検知が効く。同時更新が想定されるフィールドは `patch` / `patch_status` を推奨する。
@@ -1191,13 +1191,14 @@ Manager#add
 
 - Informer に timer スレッドを追加し、`resync_period` 秒ごとに **ストア内の全オブジェクトを合成 delta として handler に再配信する** (client-go の resync 相当)。§2.3.2 の relist が発行するのは「差分だけのイベント」(resourceVersion が変わっていないオブジェクトにはイベントが飛ばない) のため、relist 差分を流用した定期同期では外部状態のドリフトを修復できない。resync は API List を伴わないローカル処理とし、全オブジェクトを無条件に再配信する。
 - 既定値: 10h (controller-runtime SyncPeriod 相当)。`Manager.new(resync_period:)` → SharedCache → Informer へ伝播。`0` / `nil` で無効。
-- watch 切断時の relist (新鮮な List + 差分配信) は従来どおり維持する。
+- 合成 delta は predicate 適用前に配信する (§2.14): `Predicated` をバイパスして下位 handler に直接渡すため、GenerationChanged 系 predicate を設定していてもドリフト修復の reconcile が失われない (predicate は watch イベントのフィルタ用途とする)。
+- watch 切断時の relist (新鮮な List + 差分配信) は従来どおり維持する。relist は watch スレッド上で `watch_once` が終了した後にのみ実行されるため、watch 中の delta と relist snapshot の競合 (古い List でストア / resourceVersion を巻き戻す) は発生しない。Phase 6 実装でも relist を timer スレッドから直接呼ばないこと。
 - 負荷特性は §9.5 参照。
 
 #### 2.13.2 Server-side Selector (F-18)
 
 - `register(gvk:, label_selector:, field_selector:)` を追加し、List / Watch URL に `labelSelector` / `fieldSelector` を URL エンコードして付与する。
-- relist (watch 切断時 / 定期 resync) も同一条件で再取得するため、ストアは常に「セレクタに合致する集合」を保つ。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ)。
+- watch 切断時の relist も同一条件で再取得するため、ストアは常に「セレクタに合致する集合」を保つ。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ)。定期 resync (§2.13.1) は既存ストアの再配信であり、再取得は行わない。
 - 既存 `SharedCache#list` のクライアント側フィルタは残置 (後方互換) し、サーバー側フィルタを第一に使う。
 
 #### 2.13.3 Field Index (issue #16, §2.3.1 で既に定義)
@@ -1229,7 +1230,11 @@ manager.for(CronTask).with_predicate(->(obj) { obj.dig("metadata", "labels", "te
 ```
 
 - 互換契約: predicate の種別は `arity` ではなく **包む型** (`Predicate::EventPredicate` か素の proc か) で判定する。`EventPredicate` と事前定義 predicate には `Event::*` を渡し、素の proc / lambda には従来どおり生 Hash を渡す。(初版に書いた「arity 1 で従来形と判定」は、イベント型 lambda も arity 1 になるため破綻する — 0.2 レビューで廃止)
-- old の供給: Informer は delta 適用前の値を持っているため、handler 契約を `handle(type, obj, old_obj: nil)` に拡張する。既存 handler (`EnqueuedObject` 等) は余分な引数を無視するため無変更で動作する。`Predicated` が old / new から `Event::Update` を構築する。
+- old の供給と handler 互換: Informer は delta 適用前の値を保持しており、配信時に old_obj を渡せる。ただし既存 handler (`EnqueuedObject` / `EnqueuedOwner` / ユーザー定義) の `handle` は固定 2 引数メソッドで、`old_obj:` をそのまま渡すと `ArgumentError (given 3, expected 2)` となり、Informer の例外処理でイベントが破棄される。そこで配信の判定は `handler.method(:handle).parameters` に `old_obj` キーワードが存在するかで行う:
+  - 新形式 (`def handle(type, obj, old_obj: nil)` — `old_obj` キーワードあり) → old_obj を渡す。組み込み handler (`EnqueuedObject` / `EnqueuedOwner` / `Predicated`) はこの署名に更新する。
+  - 従来形式 (2 引数) → 従来どおり `handle(type, obj)` で呼ぶ。既存の 2 引数カスタム handler は無変更で動作する。
+  (predicate と異なり handler は 2 引数か keyword かで署名が分かれるため、`parameters` 判定で両形式を確実に識別できる。初版に書いた「余分な引数は無視される」は Ruby メソッドには当てはまらない — 0.2 レビューで修正)
+- `Predicated` は old_obj を受け取った場合に old / new から `Event::Update` を構築する。`Predicated` から下位 handler への配信も同じ判定 (`parameters` による新旧判定) に従う。
 
 ### 2.15 EventRecorder (F-14)
 
@@ -1251,7 +1256,7 @@ recorder = manager.recorder_for("cron-task")
 | 項目 | 設計 |
 |---|---|
 | API | `POST /apis/events.k8s.io/v1/namespaces/<ns>/events` (events.k8s.io/v1 Event) |
-| v1 スキーマ準拠 | ペイロードは v1 フィールド名を使用: `regarding` / `note` / `reportingController` / `reportingInstance` / `eventTime`。core/v1 由来の deprecated フィールド (`involvedObject` / `source` / `firstTimestamp` / `lastTimestamp` / `count`) は使用しない — 新規 v1 Event では不許可 |
+| v1 スキーマ準拠 | ペイロードは v1 フィールド名を使用: `regarding` / `note` / `reportingController` / `reportingInstance` / `eventTime`。`action` / `reason` / `reportingController` / `reportingInstance` は新規 v1 Event で必須 (常に設定する)。core/v1 由来の deprecated フィールド (`involvedObject` / `source` / `firstTimestamp` / `lastTimestamp` / `count`) は使用しない — 新規 v1 Event では不許可 (`deprecatedFirstTimestamp` 等への互換設定が必要な場合のみ使用可) |
 | 非同期 | 送信は専用ワーカースレッド + 有界キュー (既定 256)。溢れた場合は捨てて warn ログ (reconcile を失敗させない) |
 | 重複抑止 | `(regarding.uid, reason, note)` をキーに同一イベントを series (count, lastObservedTime) の増分 PATCH で集約 |
 | DSL の引数名 | `event(object, type:, reason:, message:)` の `message:` は payload の `note` に写像する |
@@ -1262,12 +1267,13 @@ recorder = manager.recorder_for("cron-task")
 
 | 項目 | 設計 |
 |---|---|
-| エンドポイント | `GET /healthz` (プロセス生存: 常時 200) / `GET /readyz` (全 informer synced かつ `leader_elect: false` またはリーダー取得済み → 200、それ以外 503) |
+| エンドポイント | `GET /healthz` (プロセス生存: 常時 200) / `GET /readyz` — 既定は「全 informer synced」で 200 (リーダー有無は不問: スタンバイ Pod も Ready にする)。`ready_gate: :leader` オプションで「リーダー取得済みのみ 200」に変更できる |
+| readyz の意味論 | スタンバイ Ready を既定にする。リーダーのみ Ready にすると、RollingUpdate の単一レプリカ構成では「新 Pod がリース待ちで Ready にならない ↔ Kubernetes が新 Pod の Ready を待って旧 Pod を終了しない」のデッドロックでロールアウトが停止する。リーダーのみ Ready を使う場合は Deployment を Recreate 戦略にする必要がある |
 | 実装 | 依存追加なしの軽量 HTTP サーバー (TCPServer + accept スレッド、GET のみ)。WEBrick は Ruby 3.0+ で bundled gem 化しており、依存追加を避ける (§9.6) |
 | 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081")` / `nil` で無効 |
 | 起動 | Manager#start で非ブロック起動、stop 時に確実に閉じる (NFR-10) |
 | bind 失敗 | Manager 起動失敗 (設定エラーとして表面化) |
-| scaffold | §2.18 の Deployment に liveness (`/healthz`) / readiness (`/readyz`) を追加 |
+| scaffold | §2.18 の Deployment に liveness (`/healthz`) / readiness (`/readyz`) を追加。既定は RollingUpdate + スタンバイ Ready 形。リーダーのみ Ready を選んだ場合は Recreate 戦略への変更を scaffold 注記で促す |
 
 ### 2.17 Metrics (F-23, 旧 O-03)
 
@@ -1342,7 +1348,7 @@ end
 | TLS | cert-manager 前提 (scaffold に Certificate 生成 + annotation)。dev は self-signed (Q2) |
 | failurePolicy | webhook 登録時に指定 (既定 Fail / Ignore) |
 | CLI | `kruby-controller create webhook` — ValidatingWebhookConfiguration 等の manifest 生成 |
-| 例外時 | validate の例外 → AdmissionResponse error + ログ (§5)。failurePolicy に従う |
+| 例外時 | validate / mutate の例外 → HTTP 5xx 応答 (failurePolicy に従う: Fail → deny / Ignore → allow)。一方、明示的な検証 NG は AdmissionResponse `allowed: false` + `status` (message) で応答し、failurePolicy の影響を受けない。両者を混同すると `failurePolicy: Ignore` 下でも例外が「明示的拒否」として処理停止を招くため区別する (§5) |
 
 #### 2.19.2 Conversion (F-22)
 
@@ -1471,7 +1477,7 @@ Main Thread
 | ControllerClient update で 409 (連続) | 再取得 → 最大 5 回再適用 → 上限で `ConflictError` を raise (指数バックオフに合流) |
 | EventRecorder 送信失敗 | ログのみ (reconcile に影響させない) |
 | Probe / Metrics の bind 失敗 | Manager 起動失敗 (設定エラーとして表面化) |
-| Webhook validate 例外 | AdmissionResponse error + ログ。failurePolicy (Fail → deny / Ignore → 許可) に従う |
+| Webhook validate 例外 | HTTP 5xx 応答 → failurePolicy に従う (Fail → deny / Ignore → 許可)。明示的な検証 NG (`allowed: false` + status) は failurePolicy をバイパスする — 両者を混同しない |
 
 ---
 

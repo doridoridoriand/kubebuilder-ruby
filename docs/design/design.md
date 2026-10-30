@@ -13,7 +13,7 @@
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
-| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新。レビュー対応: events.k8s.io/v1 のフィールド名訂正 (regarding / note / reportingController / eventTime)、predicate 互換契約の明示化 (arity 判定の廃止)、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持 |
 
 ---
 
@@ -1148,7 +1148,7 @@ class KrubyController::Client::ControllerClient
   # --- write (ApiClient#build_request で直接構築) ---
   def create(obj)                 # POST collection path
   def update(obj)                 # PUT object path。409 → 再取得 → 最大 5 回 (F-13)
-  def patch(obj, type: :merge)    # PATCH。type: :merge (merge-patch+json) | :json (json-patch+json)
+  def patch(obj, type: :merge)    # PATCH。type: :merge (merge-patch+json) | :json (json-patch+json)。ボディに metadata.resourceVersion を含める (競合検知)
   def delete(obj)                 # DELETE object path
   def patch_status(obj, status_patch = nil)  # PATCH {object_path}/status (merge-patch)
 end
@@ -1180,18 +1180,19 @@ Manager#add
 | 挙動 | 設計 |
 |---|---|
 | update | obj の `metadata.resourceVersion` を伴って PUT。409 Conflict → サーバーから再取得 → 再 PUT。最大 5 回、上限で `KrubyController::ConflictError` を raise |
-| patch_status | merge-patch は resourceVersion を伴わないため競合しない。前提に依存する status 更新は update(status) + RV を推奨 |
+| patch / patch_status | merge-patch ボディに `metadata.resourceVersion` を含める (キャッシュ / 直前取得の値)。apiserver は適用後の RV を検証し、不一致を 409 として返すため、merge-patch でも競合検知が効く。409 → 再取得 → 再適用 (最大 5 回) |
 | 409 リトライの位置づけ | reconcile のエラーにはしない (ControllerClient 内で完結)。上限超過のみエラー化 → Controller の指数バックオフに自然合流 |
 
-注意: 全体 PUT の再適用は、再取得後のオブジェクトを送信するため、リトライ間の同時更新を握り潰しうる。頻繁に同時更新されるフィールドは `patch` (merge) を推奨する。
+注意: 全体 PUT の再適用は、再取得後のオブジェクトを送信するため、リトライ間の同時更新を握り潰しうる。merge-patch は対象フィールドのみ更新するためこのリスクが低く、かつ RV による競合検知が効く。同時更新が想定されるフィールドは `patch` / `patch_status` を推奨する。
 
 ### 2.13 キャッシュ拡張: Resync / Server-side Selector / Field Index (F-16 / F-18 / issue #16)
 
 #### 2.13.1 定期 Resync (F-16)
 
-- Informer に timer スレッドを追加し、`resync_period` 秒ごとに §2.3.2 の relist 経路 (`fetch_list` → `apply_list`) を再実行する。差分配信 (`emit_relist_events`) を流用するため、watch 断に依らない定期同期でも reconcile 要求が再発行される。
+- Informer に timer スレッドを追加し、`resync_period` 秒ごとに **ストア内の全オブジェクトを合成 delta として handler に再配信する** (client-go の resync 相当)。§2.3.2 の relist が発行するのは「差分だけのイベント」(resourceVersion が変わっていないオブジェクトにはイベントが飛ばない) のため、relist 差分を流用した定期同期では外部状態のドリフトを修復できない。resync は API List を伴わないローカル処理とし、全オブジェクトを無条件に再配信する。
 - 既定値: 10h (controller-runtime SyncPeriod 相当)。`Manager.new(resync_period:)` → SharedCache → Informer へ伝播。`0` / `nil` で無効。
-- API 負荷と実装上の留意は §9.5 / §9.8 参照。
+- watch 切断時の relist (新鮮な List + 差分配信) は従来どおり維持する。
+- 負荷特性は §9.5 参照。
 
 #### 2.13.2 Server-side Selector (F-18)
 
@@ -1216,15 +1217,18 @@ KrubyController::Event::Update.new(object_old:, object_new:)
 KrubyController::Event::Delete.new(object:)
 KrubyController::Event::Generic.new(object:)
 
-# 事前定義 predicate
+# 事前定義 predicate (EventPredicate インスタンス)
 KrubyController::Event::Predicates.generation_changed  # old.generation != new.generation
 KrubyController::Event::Predicates.always
 
-# 利用側 (Builder / Manager#add の predicate:)
-manager.for(CronTask).with_predicate(->(event) { event.generation_changed? })
+# イベント型 predicate は明示的に包む
+manager.for(CronTask).with_predicate(KrubyController::Predicate.event { |event| event.generation_changed? })
+
+# 従来形 (obj 受け取り) はそのまま
+manager.for(CronTask).with_predicate(->(obj) { obj.dig("metadata", "labels", "team") == "infra" })
 ```
 
-- 後方互換: `Predicated` は predicate の `arity` で判定する。arity 1 → 従来形 (obj のみ)。それ以外 → イベント型オブジェクトを渡す。
+- 互換契約: predicate の種別は `arity` ではなく **包む型** (`Predicate::EventPredicate` か素の proc か) で判定する。`EventPredicate` と事前定義 predicate には `Event::*` を渡し、素の proc / lambda には従来どおり生 Hash を渡す。(初版に書いた「arity 1 で従来形と判定」は、イベント型 lambda も arity 1 になるため破綻する — 0.2 レビューで廃止)
 - old の供給: Informer は delta 適用前の値を持っているため、handler 契約を `handle(type, obj, old_obj: nil)` に拡張する。既存 handler (`EnqueuedObject` 等) は余分な引数を無視するため無変更で動作する。`Predicated` が old / new から `Event::Update` を構築する。
 
 ### 2.15 EventRecorder (F-14)
@@ -1247,9 +1251,10 @@ recorder = manager.recorder_for("cron-task")
 | 項目 | 設計 |
 |---|---|
 | API | `POST /apis/events.k8s.io/v1/namespaces/<ns>/events` (events.k8s.io/v1 Event) |
+| v1 スキーマ準拠 | ペイロードは v1 フィールド名を使用: `regarding` / `note` / `reportingController` / `reportingInstance` / `eventTime`。core/v1 由来の deprecated フィールド (`involvedObject` / `source` / `firstTimestamp` / `lastTimestamp` / `count`) は使用しない — 新規 v1 Event では不許可 |
 | 非同期 | 送信は専用ワーカースレッド + 有界キュー (既定 256)。溢れた場合は捨てて warn ログ (reconcile を失敗させない) |
-| 重複抑止 | `(involvedObject.uid, reason, message)` をキーに同一イベントを series (count, lastObservedTime) の増分 PATCH で集約 |
-| 埋め込みフィールド | reportingComponent / reportingInstance / action / eventTime / firstTimestamp |
+| 重複抑止 | `(regarding.uid, reason, note)` をキーに同一イベントを series (count, lastObservedTime) の増分 PATCH で集約 |
+| DSL の引数名 | `event(object, type:, reason:, message:)` の `message:` は payload の `note` に写像する |
 | 失敗 | ログのみ。reconcile のエラーにはしない (§5) |
 | RBAC | `events` の create / patch / update を scaffold (§2.18) に追加 |
 
@@ -1639,10 +1644,10 @@ attribute :template, type: :object,
 
 **判断**: 独立 gem (`kruby-controller`) としてリリース。kruby 本体には依存しない（`kruby ~> 1.36` 依存宣言のみ）。これは kruby が API client に集中し、controller フレームワークは別の lifecycle で発展するため。
 
-### 9.5 定期 resync の API 負荷 (F-16)
+### 9.5 定期 resync の負荷 (F-16)
 
-**課題**: 定期 resync (既定 10h) は GVK 数に比例して List を発行する。多数の GVK を監視するコントローラーでは API 負荷が問題になりうる。
-**対応**: 既定値は 10h とし、`resync_period: nil` で無効化できる。短期間の増発は watch 断時の relist で代替する。
+**課題**: 定期 resync はストア内の全オブジェクトを再配信するため、イベント処理負荷は GVK 数 × オブジェクト数に比例する。ただし API List は発生しない (ローカルストアの再配信であり、§2.3.2 の relist とは異なる)。
+**対応**: 既定値は 10h とし、`resync_period: nil` で無効化できる。大規模キャッシュでは resync_period の引き上げを推奨する。
 
 ### 9.6 Ruby での HTTP サーバー (Probe / Metrics / Webhook) (F-15 / F-23 / F-21)
 

@@ -3,9 +3,17 @@
 | 項目 | 内容 |
 |---|---|
 | 名称 | **Kruby Controller Framework** (gem 名: `kruby-controller`) |
+| 文書番号 | KRC-DES-001 |
 | 仕様書参照 | [specification.md](./specification.md) |
-| バージョン | Draft 0.1 |
-| 日付 | 2026-06-10 |
+| バージョン | Draft 0.2 |
+| 日付 | 2026-10-30 |
+
+**変更履歴**
+
+| 版 | 日付 | 変更 |
+|---|---|---|
+| 0.1 | 2026-06-10 | 初版 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新 |
 
 ---
 
@@ -87,6 +95,21 @@ Informer Watch ────────►│  (ADDED / MODIFIED / DELETED)
 
 ---
 
+### 1.3 追加コンポーネント (0.2 / Phase 5〜9)
+
+kubebuilder 差分分析 (0.2) で追加するコンポーネント。既存コンポーネントの設計 (§2.1〜§2.11) は不変。
+
+| コンポーネント | Phase | 役割 | 詳細 |
+|---|---|---|---|
+| `Client::ControllerClient` | 5 | Reconciler へ注入する統合 read/write クライアント | §2.12 |
+| `Event::Predicates` | 6 | old/new 付きイベント predicate | §2.14 |
+| `Recorder::EventRecorder` | 7 | Kubernetes Events 送出 | §2.15 |
+| `Probe::Server` | 7 | /healthz, /readyz | §2.16 |
+| `Metrics::Registry` | 7 | /metrics 出力 | §2.17 |
+| `Webhook::Server` | 9 | AdmissionReview v1 受信 | §2.19 |
+
+---
+
 ## 2. モジュール設計
 
 ### 2.1 全体構成 (Directory Layout)
@@ -128,7 +151,20 @@ kruby-controller/
 │       ├── cli/
 │       │   ├── init_command.rb        # `init` command
 │       │   └── create_api_command.rb  # `create api` command
-│       └── logger.rb                  # Unified logger
+│       ├── logger.rb                  # Unified logger
+│       ├── client/                    # [Phase 5]
+│       │   └── controller_client.rb   # ControllerClient (cache read + API write)
+│       ├── event/                     # [Phase 6]
+│       │   ├── events.rb              # Create/Update/Delete/Generic
+│       │   └── predicates.rb          # 事前定義 predicate
+│       ├── recorder/                  # [Phase 7]
+│       │   └── event_recorder.rb      # events.k8s.io/v1 Event 送出
+│       ├── probe/                     # [Phase 7]
+│       │   └── server.rb              # /healthz, /readyz
+│       ├── metrics/                   # [Phase 7]
+│       │   └── registry.rb            # /metrics (Prometheus text format)
+│       └── webhook/                   # [Phase 9]
+│           └── server.rb              # AdmissionReview v1 受信
 ├── exe/
 │   └── kruby-controller               # CLI entry point
 ├── spec/
@@ -1089,6 +1125,226 @@ class KrubyController::Status::StatusUpdater
 end
 ```
 
+**0.2 追記**: Phase 5 (F-11/F-13) 以降は、`client:` に §2.12 の `ControllerClient` を渡すことで `update` / `patch_status` に 409 競合リトライ (楽観的排他制御) を導入できる。`KubernetesObjectClient` は後方互換のため残存するが、新規コードでの利用は非推奨とする。
+
+---
+
+### 2.12 ControllerClient + Reconciler への依存注入 (F-11 / F-12 / F-13)
+
+kubebuilder の `client.Client` 相当。Reconciler が cache 読みと API 書き込みを単一の注入オブジェクトで行えるようにする。
+
+#### 2.12.1 ControllerClient (Interface)
+
+```ruby
+class KrubyController::Client::ControllerClient
+  def initialize(cache:, api_client:, gvk:)  # gvk: 注入元コントローラーの primary GVK
+
+  # --- read (cache-backed) ---
+  # 当該 GVK が SharedCache に watch 登録済み → キャッシュから返す
+  # 未登録 → kruby ApiClient で直接 GET / LIST (JSON Hash を返す)
+  def get(gvk, namespace, name)
+  def list(gvk, namespace: nil, label_selector: nil)
+
+  # --- write (ApiClient#build_request で直接構築) ---
+  def create(obj)                 # POST collection path
+  def update(obj)                 # PUT object path。409 → 再取得 → 最大 5 回 (F-13)
+  def patch(obj, type: :merge)    # PATCH。type: :merge (merge-patch+json) | :json (json-patch+json)
+  def delete(obj)                 # DELETE object path
+  def patch_status(obj, status_patch = nil)  # PATCH {object_path}/status (merge-patch)
+end
+```
+
+- `update` / `patch_status` は既存 `KubernetesObjectClient` と同一の契約 (`#update(obj)`, `#patch_status(obj)`) を持つため、`FinalizerManager` / `StatusUpdater` にそのまま渡せる (§2.11)。
+- `patch_status(obj, status_patch)` に第 2 引数を渡した場合は obj に status を deep-merge してから PATCH する。
+- リソースパス構築 (`/apis/<group>/<version>[namespaces/<ns>]/<resource>`) は `KubernetesObjectClient` の実装を流用する。
+
+#### 2.12.2 注入経路 (F-12)
+
+```
+Manager#add
+  └─ Controller.new(..., client: Client::ControllerClient.new(
+         cache: @cache, api_client: api_client, gvk: resolved_gvk))
+       └─ Controller#initialize
+            @reconciler.client     = client      # F-11
+            @reconciler.api_client = api_client  # 下位互換 (既存 attr_accessor)
+            @reconciler.cache      = cache       # 下位互換
+            @reconciler.logger     = logger
+```
+
+- 後方互換: 既存 Reconciler (api_client を手動構築していたもの) も attr_accessor 契約が維持されるため動作に影響しない。
+- api_client は SharedCache と同じ `Kubernetes::ApiClient` インスタンスを流用し、接続設定を二重化しない。
+- recorder は Phase 7 (F-14) 実装後に `@reconciler.recorder = manager.recorder_for(name)` で追加注入する。
+
+#### 2.12.3 競合検知 (F-13)
+
+| 挙動 | 設計 |
+|---|---|
+| update | obj の `metadata.resourceVersion` を伴って PUT。409 Conflict → サーバーから再取得 → 再 PUT。最大 5 回、上限で `KrubyController::ConflictError` を raise |
+| patch_status | merge-patch は resourceVersion を伴わないため競合しない。前提に依存する status 更新は update(status) + RV を推奨 |
+| 409 リトライの位置づけ | reconcile のエラーにはしない (ControllerClient 内で完結)。上限超過のみエラー化 → Controller の指数バックオフに自然合流 |
+
+注意: 全体 PUT の再適用は、再取得後のオブジェクトを送信するため、リトライ間の同時更新を握り潰しうる。頻繁に同時更新されるフィールドは `patch` (merge) を推奨する。
+
+### 2.13 キャッシュ拡張: Resync / Server-side Selector / Field Index (F-16 / F-18 / issue #16)
+
+#### 2.13.1 定期 Resync (F-16)
+
+- Informer に timer スレッドを追加し、`resync_period` 秒ごとに §2.3.2 の relist 経路 (`fetch_list` → `apply_list`) を再実行する。差分配信 (`emit_relist_events`) を流用するため、watch 断に依らない定期同期でも reconcile 要求が再発行される。
+- 既定値: 10h (controller-runtime SyncPeriod 相当)。`Manager.new(resync_period:)` → SharedCache → Informer へ伝播。`0` / `nil` で無効。
+- API 負荷と実装上の留意は §9.5 / §9.8 参照。
+
+#### 2.13.2 Server-side Selector (F-18)
+
+- `register(gvk:, label_selector:, field_selector:)` を追加し、List / Watch URL に `labelSelector` / `fieldSelector` を URL エンコードして付与する。
+- relist (watch 切断時 / 定期 resync) も同一条件で再取得するため、ストアは常に「セレクタに合致する集合」を保つ。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ)。
+- 既存 `SharedCache#list` のクライアント側フィルタは残置 (後方互換) し、サーバー側フィルタを第一に使う。
+
+#### 2.13.3 Field Index (issue #16, §2.3.1 で既に定義)
+
+- Store に `field_index[name][value] → Set(key)` を追加し、ADDED / MODIFIED / DELETED の適用時に増分更新する。
+- `index_field(gvk, field_name, extract_func)` の登録時点で全オブジェクトを一括索引化する (登録前のオブジェクトも含む)。
+- `get_by_field(gvk, field_name, field_value, namespace:)` → 索引から取得。
+
+### 2.14 Predicate 拡張 (F-17)
+
+kubebuilder の `predicate.UpdateEvent` (ObjectOld / ObjectNew) 相当。
+
+```ruby
+# イベント値オブジェクト (Phase 6)
+KrubyController::Event::Create.new(object:)
+KrubyController::Event::Update.new(object_old:, object_new:)
+KrubyController::Event::Delete.new(object:)
+KrubyController::Event::Generic.new(object:)
+
+# 事前定義 predicate
+KrubyController::Event::Predicates.generation_changed  # old.generation != new.generation
+KrubyController::Event::Predicates.always
+
+# 利用側 (Builder / Manager#add の predicate:)
+manager.for(CronTask).with_predicate(->(event) { event.generation_changed? })
+```
+
+- 後方互換: `Predicated` は predicate の `arity` で判定する。arity 1 → 従来形 (obj のみ)。それ以外 → イベント型オブジェクトを渡す。
+- old の供給: Informer は delta 適用前の値を持っているため、handler 契約を `handle(type, obj, old_obj: nil)` に拡張する。既存 handler (`EnqueuedObject` 等) は余分な引数を無視するため無変更で動作する。`Predicated` が old / new から `Event::Update` を構築する。
+
+### 2.15 EventRecorder (F-14)
+
+kubebuilder の `record.EventRecorder` / `mgr.GetEventRecorderFor` 相当。
+
+```ruby
+class KrubyController::Recorder::EventRecorder
+  def initialize(client:, component:)   # client: ApiClient (events.k8s.io/v1)
+
+  # type: :normal | :warning
+  def event(object, type:, reason:, message:)
+  def eventf(object, type:, reason:, format:, *args)
+end
+
+# Manager からコントローラー単位で取得
+recorder = manager.recorder_for("cron-task")
+```
+
+| 項目 | 設計 |
+|---|---|
+| API | `POST /apis/events.k8s.io/v1/namespaces/<ns>/events` (events.k8s.io/v1 Event) |
+| 非同期 | 送信は専用ワーカースレッド + 有界キュー (既定 256)。溢れた場合は捨てて warn ログ (reconcile を失敗させない) |
+| 重複抑止 | `(involvedObject.uid, reason, message)` をキーに同一イベントを series (count, lastObservedTime) の増分 PATCH で集約 |
+| 埋め込みフィールド | reportingComponent / reportingInstance / action / eventTime / firstTimestamp |
+| 失敗 | ログのみ。reconcile のエラーにはしない (§5) |
+| RBAC | `events` の create / patch / update を scaffold (§2.18) に追加 |
+
+### 2.16 Health Probe (F-15)
+
+| 項目 | 設計 |
+|---|---|
+| エンドポイント | `GET /healthz` (プロセス生存: 常時 200) / `GET /readyz` (全 informer synced かつ `leader_elect: false` またはリーダー取得済み → 200、それ以外 503) |
+| 実装 | 依存追加なしの軽量 HTTP サーバー (TCPServer + accept スレッド、GET のみ)。WEBrick は Ruby 3.0+ で bundled gem 化しており、依存追加を避ける (§9.6) |
+| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081")` / `nil` で無効 |
+| 起動 | Manager#start で非ブロック起動、stop 時に確実に閉じる (NFR-10) |
+| bind 失敗 | Manager 起動失敗 (設定エラーとして表面化) |
+| scaffold | §2.18 の Deployment に liveness (`/healthz`) / readiness (`/readyz`) を追加 |
+
+### 2.17 Metrics (F-23, 旧 O-03)
+
+| 項目 | 設計 |
+|---|---|
+| エンドポイント | `GET /metrics` — `metrics_bind_address` (既定 nil = 無効) |
+| 指標 | `controller_reconcile_total{controller,result}` (ok / error / requeue / retry)、`controller_reconcile_duration_seconds` (histogram)、`workqueue_depth{controller}`、`workqueue_queue_duration_seconds` (histogram)、`leader_elected` (gauge) |
+| 実装方式 | Q1: `prometheus_client` gem を依存追加するか、テキスト形式を自前実装するか (依存最小方針と天秤)。Phase 7 設計時に決定 |
+| 基盤 | Probe (§2.16) と同一の軽量 HTTP サーバーを共用 |
+
+### 2.18 Scaffolding 完全化 + CRD DSL 拡張 (F-19 / F-20 / F-24)
+
+#### 2.18.1 Makefile / Dockerfile / Kustomize / CI (F-20)
+
+`init` が追加生成するファイル:
+
+| ファイル | 内容 |
+|---|---|
+| `Makefile` | `install` (CRD apply), `uninstall`, `run` (ローカル実行), `manifests` (CRD YAML 再生成), `build`, `docker-build`, `docker-push`, `deploy`, `undeploy`, `test` |
+| `Dockerfile` | `ruby:3.3-slim` ベース、`bundle install`、`CMD ["bin/manager"]`。buildx で linux/amd64 + linux/arm64 |
+| `.dockerignore` | spec/, docs/, .git など |
+| `config/kustomization.yaml` ほか | Kustomize 構成 (`config/{crd,rbac,manager,default}`) |
+| `config/samples/<group>_<plural>_sample.yaml` | `create api` がサンプルを生成 |
+| `.github/workflows/ruby.yml` | rubocop + rspec の CI |
+
+`create api` も Kustomize 構成への CRD / RBAC 追記に対応する。RBAC の「使用 API からの自動生成」(+kubebuilder:rbac 相当) は簡易対応にとどめ、完全な marker 相当は将来検討 (O-04)。
+
+#### 2.18.2 CRD DSL 検証制約 (F-19, issue #15 残部)
+
+```ruby
+attribute :replicas, type: :integer,
+  minimum: 1, maximum: 100, nullable: false
+attribute :name, type: :string,
+  pattern: "^[a-z0-9-]+$", min_length: 1, max_length: 63
+
+# additionalPrinterColumns
+printer_column :age, json_path: ".metadata.creationTimestamp", type: :date
+printer_column :priority, json_path: ".spec.priority", type: :string
+```
+
+- 複数形化 / shortNames は既に実装済み。残課題は additionalPrinterColumns と上記制約の出力 (issue #15)。
+- 複数 version CRD (served / storage の切替) は F-22 と一体で対応する (Phase 9)。
+
+#### 2.18.3 Typed Resource Accessor (F-24, O-04 の簡易版)
+
+- CRD DSL から `define_method` で spec / status パスの読み取りアクセサを生成する (`cron_task.spec.schedule` 等)。内部データは Hash のまま保持する。
+- Go 相当の完全な型生成・deepcopy は不要 (Ruby では参照共有で十分)。schema 定義と実データの乖離チェックは scope 外。
+
+### 2.19 Webhook (F-21 / F-22, 旧 O-01 / O-02)
+
+#### 2.19.1 Validating / Mutating (F-21)
+
+```ruby
+class CronTask
+  include KrubyController::CRD
+
+  # Validating
+  validate :schedule_format do |obj, errors|
+    errors.add(:schedule, "invalid cron") unless valid_cron?(obj)
+  end
+
+  # Mutating (defaulting)
+  mutate :defaults do |obj|
+    obj["spec"]["replicas"] ||= 1
+  end
+end
+```
+
+| 項目 | 設計 |
+|---|---|
+| サーバー | `Webhook::Server` (§2.16 と同基盤 + TLS)。`AdmissionReview` (admission.k8s.io/v1) 受信 → `AdmissionResponse` 応答 |
+| TLS | cert-manager 前提 (scaffold に Certificate 生成 + annotation)。dev は self-signed (Q2) |
+| failurePolicy | webhook 登録時に指定 (既定 Fail / Ignore) |
+| CLI | `kruby-controller create webhook` — ValidatingWebhookConfiguration 等の manifest 生成 |
+| 例外時 | validate の例外 → AdmissionResponse error + ログ (§5)。failurePolicy に従う |
+
+#### 2.19.2 Conversion (F-22)
+
+- CRD DSL に複数 version 宣言 (`self.versions = [:v1, :v1beta1]`) と変換フックを追加。
+- `apiextensions.k8s.io/v1` の `conversion.webhook` に応答する。サーバー基盤は F-21 と共用。
+- 単一 version 運用では不要なため、F-21 実装後に着手する。
+
 ---
 
 ## 3. Controller Builder (Fluent API)
@@ -1181,6 +1437,9 @@ Main Thread
   └─ [Per-Controller]
       └─ Worker threads (max_concurrent per controller)
           └─ reconcile(request) ← I/O waiting
+  └─ [Phase 6] Informer resync timer thread
+  └─ [Phase 7] EventRecorder worker thread (bounded queue)
+  └─ [Phase 7] Probe / Metrics server accept thread
 ```
 
 **スレッドセーフ要件**:
@@ -1202,8 +1461,12 @@ Main Thread
 | List 失敗 (初回 sync) | 3 回リトライ → Manager startup 失敗 |
 | API 404 (リソース削除済み) | reconcile で `Result.ok` (no-op) |
 | API 429 (throttled) | `retry_after` で待機 |
-| API 409 (conflict) | 再取得 → 再適用 (update loop) |
+| API 409 (conflict) | 再取得 → 再適用 (update loop)。F-13 以降は ControllerClient が最大 5 回自動リトライ |
 | Leader election 失敗 | リード候補外 → reconcile 一時停止 → 再取得時再開 |
+| ControllerClient update で 409 (連続) | 再取得 → 最大 5 回再適用 → 上限で `ConflictError` を raise (指数バックオフに合流) |
+| EventRecorder 送信失敗 | ログのみ (reconcile に影響させない) |
+| Probe / Metrics の bind 失敗 | Manager 起動失敗 (設定エラーとして表面化) |
+| Webhook validate 例外 | AdmissionResponse error + ログ。failurePolicy (Fail → deny / Ignore → 許可) に従う |
 
 ---
 
@@ -1248,6 +1511,48 @@ Main Thread
 | 18 | 統合テスト (kind) | `specs/integration/` |
 | 19 | ドキュメント | `README.md`, `docs/` |
 
+### Phase 5: Client 統合 (MUST)
+
+| # | タスク | 成果物 |
+|---|---|---|
+| 20 | ControllerClient (cache read + API write) | `client/controller_client.rb` + テスト |
+| 21 | Reconciler への依存注入 | `controller.rb`, `manager.rb` |
+| 22 | 409 競合リトライ + helpers の ControllerClient 移行 | `status/`, `finalizer/` |
+
+### Phase 6: キャッシュ・イベント拡張 (SHOULD)
+
+| # | タスク | 成果物 |
+|---|---|---|
+| 23 | 定期 resync | `cache/informer.rb` |
+| 24 | Server-side selector | `cache/` |
+| 25 | Field index | `cache/store.rb`, `cache/cache.rb` (issue #16) |
+| 26 | Predicate old/new + 事前定義 | `event/`, `handler/` |
+
+### Phase 7: 運用機能 (SHOULD)
+
+| # | タスク | 成果物 |
+|---|---|---|
+| 27 | EventRecorder | `recorder/event_recorder.rb` |
+| 28 | Health Probe | `probe/server.rb` |
+| 29 | Metrics | `metrics/registry.rb` (方式は Q1) |
+
+### Phase 8: Scaffold + CRD 拡張 (SHOULD)
+
+| # | タスク | 成果物 |
+|---|---|---|
+| 30 | Makefile / Dockerfile / Kustomize / CI | `cli/templates/` |
+| 31 | DSL 検証制約 + printer columns | `crd.rb`, `generator/crd_generator.rb` (issue #15 残部) |
+| 32 | Typed accessor | `crd.rb` |
+
+### Phase 9: Webhook (SHOULD)
+
+| # | タスク | 成果物 |
+|---|---|---|
+| 33 | Validating / Mutating webhook | `webhook/` |
+| 34 | Conversion webhook | `webhook/`, `generator/crd_generator.rb` |
+
+**実施順序 (推奨)**: Phase 4 (issue #17) は現行 API でも着手可能だが、Phase 5 の client 注入後のほうが hello-world が最小構成になる。推奨順序: **Phase 5 → Phase 4 → Phase 6 → 7 → 8 → 9**。各 Phase は独立 PR (ユーザーマージゲート) で進め、Phase 4 の kind E2E は実測エビデンスを残す。
+
 ---
 
 ## 7. kruby 依存の詳細
@@ -1263,8 +1568,13 @@ Main Thread
 | `LeaderElector` | `Kubernetes::CoordinationV1Api` | Lease API |
 | `StatusUpdater` | `Kubernetes::CustomObjectsApi` (patch_status 相当) | Status PATCH |
 | `Reconciler` | 各種 `Kubernetes::*Api` | API 操作 |
+| `ControllerClient` (F-11) | `Kubernetes::ApiClient#build_request` | PUT / PATCH / POST / DELETE を直接構築 (kruby CustomObjectsApi には PUT update / merge-patch が無いため) |
+| `EventRecorder` (F-14) | `Kubernetes::ApiClient#build_request` | events.k8s.io/v1 の送出 |
+| `Webhook::Server` (F-21) | 受信側のみ (admission.k8s.io) | TLS は OpenSSL 標準ライブラリ |
 
 **重要な依存**: kruby の `Kubernetes::Watch` はストリーミング HTTP 接続を提供。これが Informer の基盤。
+
+**移収事項 (T1)**: kruby 側へ PUT update / merge-patch / json-patch の上位 API (現状 `KubernetesObjectClient` が ApiClient 直接で担っている領域) を提供するかの判断は Phase 5 完了後に行う。当面は本 gem 内で `ApiClient#build_request` を直接利用する。
 
 ---
 
@@ -1276,7 +1586,7 @@ Main Thread
 | `ctrl.Options` | Manager 初期化オプション | |
 | `controller.Reconcile` | `Reconciler#reconcile` | |
 | `reconcile.Result` | `KrubyController::Result` | |
-| `client.Client` | SharedCache (read) + kruby ApiClient (write) | |
+| `client.Client` | `Client::ControllerClient` (Phase 5, F-11) | 現状は SharedCache (read) + kruby ApiClient (write) の手動構成 |
 | `cache.Cache` | `KrubyController::Cache::SharedCache` | |
 | `handler.EnqueueRequestForObject` | `Handler::EnqueueRequestForObject` | |
 | `handler.EnqueueRequestForOwner` | `Handler::EnqueueRequestForOwner` | |
@@ -1286,6 +1596,15 @@ Main Thread
 | `scaffolds/init` | `kruby-controller init` | |
 | `scaffolds/api` | `kruby-controller create api` | |
 | `crd.Upgrade` | CRD Generator | Ruby DSL → YAML |
+| `mgr.GetEventRecorderFor` / `record.EventRecorder` | `Recorder::EventRecorder` (Phase 7, F-14) | events.k8s.io/v1 |
+| `healthz` / `readyz` handler | `Probe::Server` (Phase 7, F-15) | |
+| `metrics` (promhttp) | `Metrics::Registry` (Phase 7, F-23) | 実装方式は Q1 |
+| `cache.AddIndex` / `GetIndexer` | `SharedCache#index_field` / `get_by_field` (§2.3.1) | 未実装 (issue #16, Phase 6) |
+| `predicate.*` (UpdateEvent) | `Event::*` + `Event::Predicates` (Phase 6, F-17) | |
+| `SyncPeriod` | Informer 定期 resync (Phase 6, F-16) | 既定 10h |
+| `webhook.Server` / `builder.WebhookManagedBy` | `Webhook::Server` + DSL (Phase 9, F-21/F-22) | |
+| `make manifests` (controller-gen) | CRD Generator + scaffold (Phase 8, F-19/F-20) | Go marker の代わりに DSL |
+| `envtest` | kind E2E + fake K8s API (Phase 4) | |
 
 ---
 
@@ -1320,6 +1639,26 @@ attribute :template, type: :object,
 
 **判断**: 独立 gem (`kruby-controller`) としてリリース。kruby 本体には依存しない（`kruby ~> 1.36` 依存宣言のみ）。これは kruby が API client に集中し、controller フレームワークは別の lifecycle で発展するため。
 
+### 9.5 定期 resync の API 負荷 (F-16)
+
+**課題**: 定期 resync (既定 10h) は GVK 数に比例して List を発行する。多数の GVK を監視するコントローラーでは API 負荷が問題になりうる。
+**対応**: 既定値は 10h とし、`resync_period: nil` で無効化できる。短期間の増発は watch 断時の relist で代替する。
+
+### 9.6 Ruby での HTTP サーバー (Probe / Metrics / Webhook) (F-15 / F-23 / F-21)
+
+**課題**: probe / metrics / webhook には組み込み HTTP サーバーが必要。WEBrick は Ruby 3.0+ で bundled gem 化しており、依存最小方針と衝突する。
+**対応**: GET 応答のみの probe / metrics は `TCPServer` 自前実装 (~100 行) で対応する。Webhook は HTTPS 必須のため、OpenSSL 標準ライブラリ + 自前実装または WEBrick 依存の採用を Phase 9 設計時 (Q2) に決定する。
+
+### 9.7 Webhook の TLS 証明書 (F-21)
+
+**課題**: admission webhook は kube-apiserver から HTTPS で到達可能である必要がある。本番は cert-manager による証明書発行と CA injection が定石。
+**対応**: scaffold に cert-manager 用 manifest を生成する。開発時は self-signed 証明書 + kind での検証手順を README に記載する (Q2)。
+
+### 9.8 GVL と補助サーバー
+
+**課題**: probe / metrics / webhook サーバーの accept スレッド、recorder のワーカースレッド、resync の timer スレッドは GVL を共有する。ただしいずれも主に I/O 待ちで、reconcile の I/O 待ち時間と並行実行される (§9.1 と同様)。
+**対応**: 影響小と判断。webhook の validate ロジックが CPU 重い場合はユーザー側で Thread 分離を検討する。
+
 ---
 
 ## 10. テスト戦略
@@ -1331,3 +1670,21 @@ attribute :template, type: :object,
 | E2E | Manager, Leader Election, 全コントローラー | kind クラスター + kruby E2E 既存インフラ |
 | Generator | CRD Generator | RSpec (出力 YAML の妥当性検証) |
 | CLI | `init`, `create api` | RSpec (テンプレート生成検証) |
+| ControllerClient (F-11) | read (cache miss → API)、write verbs、409 リトライ | RSpec, WebMock (fake K8s API) |
+| EventRecorder (F-14) | events API POST/PATCH、dedupe、非同期ワーカー | RSpec (fake events API) |
+| Health Probe / Metrics (F-15 / F-23) | HTTP 応答と ready 条件 | RSpec (実ソケット) |
+| Webhook (F-21 / F-22) | AdmissionReview v1 の受信・応答 | RSpec + kind E2E (Phase 9) |
+| Scaffold (F-20) | 生成物の構文・Makefile ターゲット | RSpec (テンプレート生成検証) + `make deploy` 実測 (kind) |
+
+---
+
+## 11. 未確定事項
+
+| Q# | 事項 | 現状の扱い | 要決定 |
+|---|---|---|---|
+| Q1 | metrics 実装方式 (`prometheus_client` gem 追加 vs テキスト形式自前) | 自前実装 (依存最小) を既定案に | Phase 7 設計時 |
+| Q2 | Webhook TLS 証明書 (cert-manager 前提 vs 自前生成) と HTTPS サーバー実装 | cert-manager 前提 + 自前サーバーを既定案に | Phase 9 設計時 |
+| Q3 | Typed accessor (F-24) の適用範囲 (spec/status の 1 階層か、ネスト object も含むか) | spec/status の DSL 宣言済みパスのみを既定案に | Phase 8 設計時 |
+| Q4 | Phase 4 (hello-world) の実施タイミング | Phase 5 完了後 (client 注入後が最小構成) を推奨 | Phase 5 完了時 |
+| Q5 | Kustomize の採用範囲 (フル Kustomize vs フラット manifest 拡張) | フル Kustomize を既定案に | Phase 8 設計時 |
+| Q6 | 移収: kruby へ PUT update / merge-patch の上位 API を提供するか (T1) | 本 gem 内で `ApiClient#build_request` 直接利用 | Phase 5 完了後 |

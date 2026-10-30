@@ -14,7 +14,7 @@
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
-| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加。レビュー対応: EventRecorder を events.k8s.io/v1 スキーマ準拠に訂正、predicate の互換契約を明示化、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持 |
 
 ---
 
@@ -229,8 +229,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-13 |
 | 説明 | update / patch_status における optimistic concurrency control (F-10 の強化) |
-| 仕様 | `update` は resourceVersion を保持して PUT。409 (conflict) → サーバーから再取得 → 最大 5 回再適用。上限超過は `KrubyController::ConflictError` を raise (Controller の指数バックオフに合流) |
-| 制約 | 全体 PUT の再適用は同時更新を握り潰しうるため、頻繁に同時更新されるフィールドは patch (merge) を推奨 |
+| 仕様 | `update` は resourceVersion を保持して PUT。409 (conflict) → サーバーから再取得 → 最大 5 回再適用。上限超過は `KrubyController::ConflictError` を raise (Controller の指数バックオフに合流)。`patch` / `patch_status` も merge-patch ボディに `metadata.resourceVersion` を含めて競合検知する |
+| 制約 | 全体 PUT の再適用は同時更新を握り潰しうるため、頻繁に同時更新されるフィールドは patch (merge) を推奨 (merge-patch は対象フィールドのみ更新し、RV による競合検知が効く) |
 
 #### FR-14: EventRecorder
 
@@ -238,7 +238,7 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-14 |
 | 説明 | Kubernetes Events (events.k8s.io/v1) の送出 |
-| 仕様 | `event(obj, type:, reason:, message:)` / `eventf(...)`。送信は非同期 (有界キュー)、同一 (involvedObject.uid, reason, message) は series (count, lastObservedTime) 増分 |
+| 仕様 | `event(obj, type:, reason:, message:)` / `eventf(...)`。ペイロードは events.k8s.io/v1 スキーマに準拠 (`regarding` / `note` / `reportingController` / `eventTime`、deprecated な core/v1 フィールドは不使用)。送信は非同期 (有界キュー)、同一 (regarding.uid, reason, note) は series (count, lastObservedTime) 増分 |
 | 制約 | 送信失敗はログのみ (reconcile を失敗させない)。RBAC (`events` create/patch) を scaffold に追加 |
 
 #### FR-15: Health Probe
@@ -256,8 +256,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-16 |
 | 説明 | watch 切断に依らない定期的な再同期 (controller-runtime SyncPeriod 相当) |
-| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに relist を実行し、差分を delta として配信 |
-| 制約 | relist 失敗時は既存のリトライ方針に合流 |
+| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに、キャッシュ済みの全オブジェクトを合成 delta として handler に再配信する (API List なし。resourceVersion 変化の有無に依らず再配信)。watch 切断時の relist (新鮮な List + 差分配信) は従来どおり |
+| 制約 | 配信負荷はオブジェクト数に比例する (API 負荷ではない)。大規模キャッシュでは resync_period の引き上げを推奨 |
 
 #### FR-17: Predicate 拡張
 
@@ -265,8 +265,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-17 |
 | 説明 | イベント型つき predicate (Create / Update / Delete / Generic)。Update は old/new を保持 |
-| 仕様 | `predicate: ->(event) { event.generation_changed? }`。事前定義 predicate (`Event::Predicates.generation_changed` 等) を提供 |
-| 制約 | 後方互換 — `predicate.call(obj)` 形式 (arity 1) は従来どおり動作 |
+| 仕様 | イベント型 predicate は `KrubyController::Predicate.event { |event| ... }` で明示的に包む。事前定義 predicate (`Event::Predicates.generation_changed` 等) を提供 |
+| 制約 | 後方互換 — 素の proc / lambda (obj 受け取り) は従来どおり生 Hash を受け取る。種別判定は arity ではなく包む型 (`Predicate::EventPredicate` かどうか) で行う |
 
 #### FR-18: Server-side Selector
 

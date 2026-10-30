@@ -4,9 +4,17 @@
 |---|---|
 | 名称 | **Kruby Controller Framework** (コードネーム: `kruby-controller`) |
 | 目的 | kubebuilder 相当のカスタムコントローラー開発フレームワークを Ruby / kruby で提供 |
-| バージョン | Draft 0.1 |
-| 日付 | 2026-06-10 |
+| 文書番号 | KRC-SPEC-001 |
+| バージョン | Draft 0.2 |
+| 日付 | 2026-10-30 |
 | 著者 | Takahiro Ishida / Hermes |
+
+**変更履歴**
+
+| 版 | 日付 | 変更 |
+|---|---|---|
+| 0.1 | 2026-06-10 | 初版 |
+| 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加 |
 
 ---
 
@@ -20,16 +28,21 @@ Kubernetes でカスタムリソース (CRD) を運用する場合、Go 言語�
 
 ### 1.2 目指す開発者体験
 
+(0.2 注記: 以下は Phase 5 (F-11 / F-12) 完了後の目指す形。現行の実装では `reconciler.cache` と手動構築の kruby API クライアントを利用する)
+
 ```ruby
 # my_controller/reconcilers/cron_task_reconciler.rb
 class CronTaskReconciler < KrubyController::Reconciler
   def reconcile(request)
-    # desired state を取得
-    cron_task = get_cron_task(request.namespace, request.name)
+    # cache 読み (F-11: 注入された ControllerClient)
+    cron_task = client.get(CronTask, request.namespace, request.name)
+    return KrubyController::Result.ok if cron_task.nil?
 
-    # current state を確認・調整
-    job = ensure_job(cron_task)
-    update_status(cron_task, job_status: job.status)
+    # current state を確認・調整 (API 書き込み)
+    job = ensure_job(cron_task)   # client.create(job) / client.patch(job)
+
+    # status 更新 (/status subresource へ merge-patch、競合は F-13 で処理)
+    client.patch_status(cron_task, "jobStatus" => job.status)
 
     KrubyController::Result.retry_after(30)
   end
@@ -37,7 +50,7 @@ end
 
 # my_controller/manager.rb
 manager = KrubyController::Manager.new(kube_config:)
-manager.add(CronTaskReconciler, for: "CronTask")
+manager.add(CronTaskReconciler, for: "CronTask")  # F-12: client / recorder / logger を注入
 manager.start  # blocks
 ```
 
@@ -60,17 +73,41 @@ manager.start  # blocks
 | F-07 | CLI Scaffolding | **MUST** | `kruby-controller init`, `kruby-controller create api` |
 | F-08 | Finalizer Management | **SHOULD** | finalizer の追加・削除・クリーンアップを支援 |
 | F-09 | OwnerReference 管理 | **SHOULD** | controllerOf: true / blockOwnerDeletion の自動付与 |
-| F-10 | Status Subresource 支援 | **SHOULD** | status の乐观排他更新 (three-way merge 相当) |
+| F-10 | Status Subresource 支援 | **SHOULD** | status の楽観的排他制御による更新 (three-way merge 相当) |
+| F-11 | ControllerClient | **MUST** | cache 読み + API 書き込みを単一の注入オブジェクトに統合 (Phase 5) |
+| F-12 | 依存の自動注入 | **MUST** | Reconciler へ client / cache / api_client / logger / recorder を Manager が注入 (Phase 5) |
+| F-13 | 競合検知つき書き込み | **SHOULD** | resourceVersion による楽観的排他制御、409 (conflict) の再取得リトライ (Phase 5) |
+| F-14 | EventRecorder | **SHOULD** | events.k8s.io/v1 の Kubernetes Events 送出 (Phase 7) |
+| F-15 | Health Probe | **SHOULD** | `/healthz` (生存) / `/readyz` (cache sync + リーダー状態) エンドポイント (Phase 7) |
+| F-16 | 定期 Resync | **SHOULD** | watch 切断に依らない定期的な再同期 (既定 10h, Phase 6) |
+| F-17 | Predicate 拡張 | **SHOULD** | old/new 付き Update イベント、事前定義 predicate (GenerationChanged 等) (Phase 6) |
+| F-18 | Server-side Selector | **SHOULD** | List/Watch に labelSelector / fieldSelector を渡す (Phase 6) |
+| F-19 | CRD DSL 検証制約 | **SHOULD** | minimum/maximum/minLength/maxLength/pattern/format + additionalPrinterColumns (Phase 8) |
+| F-20 | Scaffold 完全化 | **SHOULD** | Makefile / Dockerfile / Kustomize 構成 / config/samples / GitHub Actions CI (Phase 8) |
+| F-21 | Validating / Mutating Webhook | **SHOULD** | AdmissionReview v1 受信・応答、`create webhook` コマンド (Phase 9) |
+| F-22 | Conversion Webhook | **SHOULD** | CRD version conversion (複数 version 宣言 + webhook 応答) (Phase 9) |
+| F-23 | Metrics | **SHOULD** | Prometheus 互換 `/metrics` (workqueue / reconcile 指標) (Phase 7) |
+| F-24 | Typed Resource Accessor | **SHOULD** | CRD DSL からの spec/status アクセサ生成 (O-04 の簡易版) (Phase 8) |
 
 ### 2.2 含まない機能 (Out of Scope — 将来検討)
 
 | ID | 機能 | 備考 |
 |---|---|---|
-| O-01 | Validating / Mutating Webhook | 重要だが Phase 2 以降 |
-| O-02 | Conversion Webhook | CRD version conversion |
-| O-03 | Metrics / Prometheus Integration | controller-runtime の metrics サポート |
-| O-04 | Predictive Scaffolding | kubebuilder v4 の Go types から CRD 推論 |
+| O-04 | Predictive Scaffolding (kubebuilder v4 の Go types から CRD 推論の完全実装) | F-24 は簡易版のみ。完全な型生成・deepcopy 相当は将来検討 |
 | O-05 | Multi-Cluster 対応 | 将来的に検討 |
+
+(0.2 注記: O-01 Validating/Mutating Webhook、O-02 Conversion Webhook、O-03 Metrics は F-21 / F-22 / F-23 として In Scope に昇格した。判断根拠は設計書 §2.17 / §2.19 および設計書 §11 の未確定事項を参照)
+
+### 2.3 実装状況
+
+| F-ID | 状態 | 備考 |
+|---|---|---|
+| F-01 〜 F-05 | 実装済み | Phase 1〜3 (PR #18〜#29 含む)。#24〜#29 で信頼性強化済み |
+| F-06 | 実装済み (一部未対応) | additionalPrinterColumns は未対応 → F-19 (Phase 8)、issue #15 |
+| F-07 | 実装済み | PR #28。Makefile/Dockerfile 等の拡張は F-20 (Phase 8) |
+| F-08 〜 F-09 | 実装済み | PR #22 |
+| F-10 | 実装済み (一部未対応) | merge-patch のみ。楽観的排他制御 (three-way) は F-13 (Phase 5) |
+| F-11 〜 F-24 | 未実装 | Phase 5 〜 9 |
 
 ---
 
@@ -168,6 +205,132 @@ manager.start  # blocks
 | 説明 | status 更新時の optimistic concurrency control |
 | 仕様 | `update_status(obj)` → spec を触らず status だけを PATCH |
 
+#### FR-11: ControllerClient
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-11 |
+| 説明 | cache 読みと API 書き込みを統合した Reconciler 用クライアント (kubebuilder の `client.Client` 相当) |
+| 仕様 | `get` / `list` は当該 GVK が watch 登録済みなら SharedCache、未登録なら直接 API。`create` / `update` / `patch` / `delete` / `patch_status` は kruby `ApiClient` で直接構築 |
+| 制約 | スレッドセーフ。外部依存の追加はしない (`ApiClient#build_request` 利用) |
+
+#### FR-12: 依存の自動注入
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-12 |
+| 説明 | Manager が Reconciler に client / cache / api_client / logger (recorder は F-14 実装後) を自動注入 |
+| 仕様 | Controller 生成時に GVK 単位の ControllerClient を構築し、既存の attr_accessor (`client=` / `cache=` / `api_client=`) 経由で設定 |
+| 制約 | 後方互換 — 仕様書 0.1 の利用コードが壊れないこと。手動構築した値は注入で上書きされる |
+
+#### FR-13: 競合検知つき書き込み
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-13 |
+| 説明 | update / patch_status における optimistic concurrency control (F-10 の強化) |
+| 仕様 | `update` は resourceVersion を保持して PUT。409 (conflict) → サーバーから再取得 → 最大 5 回再適用。上限超過は `KrubyController::ConflictError` を raise (Controller の指数バックオフに合流) |
+| 制約 | 全体 PUT の再適用は同時更新を握り潰しうるため、頻繁に同時更新されるフィールドは patch (merge) を推奨 |
+
+#### FR-14: EventRecorder
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-14 |
+| 説明 | Kubernetes Events (events.k8s.io/v1) の送出 |
+| 仕様 | `event(obj, type:, reason:, message:)` / `eventf(...)`。送信は非同期 (有界キュー)、同一 (involvedObject.uid, reason, message) は series (count, lastObservedTime) 増分 |
+| 制約 | 送信失敗はログのみ (reconcile を失敗させない)。RBAC (`events` create/patch) を scaffold に追加 |
+
+#### FR-15: Health Probe
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-15 |
+| 説明 | liveness / readiness 用 HTTP エンドポイント |
+| 仕様 | `/healthz` は常時 200 (プロセス生存)。`/readyz` は全 informer synced かつ (`leader_elect: false` またはリーダー取得済み) で 200、それ以外 503 |
+| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081")`。nil で無効 |
+
+#### FR-16: 定期 Resync
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-16 |
+| 説明 | watch 切断に依らない定期的な再同期 (controller-runtime SyncPeriod 相当) |
+| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに relist を実行し、差分を delta として配信 |
+| 制約 | relist 失敗時は既存のリトライ方針に合流 |
+
+#### FR-17: Predicate 拡張
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-17 |
+| 説明 | イベント型つき predicate (Create / Update / Delete / Generic)。Update は old/new を保持 |
+| 仕様 | `predicate: ->(event) { event.generation_changed? }`。事前定義 predicate (`Event::Predicates.generation_changed` 等) を提供 |
+| 制約 | 後方互換 — `predicate.call(obj)` 形式 (arity 1) は従来どおり動作 |
+
+#### FR-18: Server-side Selector
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-18 |
+| 説明 | Informer の List/Watch に labelSelector / fieldSelector を渡す |
+| 仕様 | `register(gvk:, label_selector:, field_selector:)` → List/Watch URL に付与。relist / 定期 resync も同一条件 |
+| 制約 | ストアは「セレクタに合致する集合」を保持。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ) |
+
+#### FR-19: CRD DSL 検証制約
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-19 |
+| 説明 | attribute DSL に OpenAPI v3 の検証制約と printer columns を追加 |
+| 仕様 | `minimum` / `maximum` / `minLength` / `maxLength` / `pattern` / `format` / `nullable`、`printer_column :name, json_path:, type:` |
+| 制約 | issue #15 残部 (複数形化 / shortNames は実装済み) |
+
+#### FR-20: Scaffold 完全化
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-20 |
+| 説明 | init / create api が kubebuilder 相当のビルド・デプロイ資産を生成 |
+| 仕様 | Makefile (install/run/manifests/build/docker-build/docker-push/deploy/undeploy/test)、Dockerfile、Kustomize 構成 (config/{crd,rbac,manager,default})、config/samples、.github/workflows CI、.dockerignore |
+| 制約 | RBAC の使用 API からの自動生成 (marker 相当) は簡易対応にとどめる (O-04) |
+
+#### FR-21: Validating / Mutating Webhook
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-21 |
+| 説明 | admission webhook の受信・応答 (旧 O-01 昇格) |
+| 仕様 | DSL で validate / mutate 登録、`AdmissionReview` (admission.k8s.io/v1) 受信 → `AdmissionResponse` 応答、TLS、`kruby-controller create webhook` コマンド |
+| 制約 | failurePolicy (Fail 既定 / Ignore)。TLS 取得方式は未確定 (設計書 Q2) |
+
+#### FR-22: Conversion Webhook
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-22 |
+| 説明 | CRD version conversion webhook (旧 O-02 昇格) |
+| 仕様 | CRD DSL に複数 version 宣言、`conversion.webhook` への応答 |
+| 制約 | F-21 のサーバー基盤を共用。F-21 実装後に着手 |
+
+#### FR-23: Metrics
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-23 |
+| 説明 | Prometheus 互換 `/metrics` エンドポイント (旧 O-03 昇格) |
+| 仕様 | `controller_reconcile_total{controller,result}`、`controller_reconcile_duration_seconds`、`workqueue_depth`、`workqueue_queue_duration_seconds`、`leader_elected` |
+| 制約 | 実装方式 (gem 追加 vs 自前テキスト出力) は未確定 (設計書 Q1) |
+
+#### FR-24: Typed Resource Accessor
+
+| 項目 | 内容 |
+|---|---|
+| 識別子 | FR-24 |
+| 説明 | CRD DSL から型付きアクセサを生成 (O-04 の簡易版) |
+| 仕様 | `cron_task.spec.schedule` 等、spec/status の DSL 宣言済みパスに `define_method` で読み取りアクセサを生成 |
+| 制約 | 内部データは Hash のまま保持 (読み取りビュー)。完全な型生成は O-04 のまま将来検討 |
+
 ---
 
 ## 4. 非機能的要件
@@ -179,9 +342,11 @@ manager.start  # blocks
 | NFR-03 | パッケージ形式 | Ruby Gem (gemspec) |
 | NFR-04 | CLI 実行環境 | Ruby 3.3+ で `bundle exec kruby-controller` |
 | NFR-05 | スレッドセーフ | shared cache はスレッドセーフであること |
-| NFR-06 |  graceful shutdown | sigterm 受信後、最大 30 秒以内に停止 |
+| NFR-06 | graceful shutdown | sigterm 受信後、最大 30 秒以内に停止 |
 | NFR-07 | ロギング | `Logger` インターフェース準拠 (デフォルト: stdout)、ログレベル変更可能 |
 | NFR-08 | 構成ファイル | `.kruby-controller.yml` (プロジェクト構成) |
+| NFR-09 | 構造化ロギング | `Logger` 互換のまま JSON 出力オプションとレベル制御 (環境変数 `KRC_LOG_LEVEL` / `KRC_LOG_FORMAT`) を提供 |
+| NFR-10 | 補助サーバーの非ブロック起動 | Probe / Metrics (Webhook 含む) の HTTP サーバーは別スレッドで起動し、Manager 停止時に確実に閉じる |
 
 ---
 
@@ -198,6 +363,11 @@ manager.start  # blocks
 | GVR | Group/Version/Resource の略。REST API パスでの識別子 |
 | Finalizer | リソース削除時に特定の処理を実行するためのメカニズム |
 | OwnerReference | リソース間の所有関係を表現する Kubernetes 原語 |
+| ControllerClient | Reconciler に注入される統合 read/write クライアント (F-11) |
+| EventRecorder | Kubernetes Events を送出するヘルパー (F-14) |
+| Resync | Informer が watch 状態に依らず定期的に行う再同期 (F-16) |
+| AdmissionReview | admission webhook のリクエスト/レスポンス形式 (admission.k8s.io/v1) |
+| Probe | liveness / readiness を判定する HTTP エンドポイント (F-15) |
 
 ---
 
@@ -208,6 +378,9 @@ manager.start  # blocks
 | kruby | Kubernetes API クライアント。Watch, ApiClient, Configuration を使用 |
 | Kubernetes クラスター | 開発時は kind / minikube。運用時は Cycloud k8s など |
 | kubectl | CLI scaffolding で kubectl 構文を理解するために参照 (必須依存ではない) |
+| events.k8s.io API | F-14 EventRecorder が使用 (ApiClient 経由) |
+| admission.k8s.io | F-21 Webhook が受信するレビュー形式 (受信側のみ、クライアント API 不要) |
+| cert-manager | F-21 Webhook の TLS 証明書 (本番前提。開発は self-signed、設計書 Q2) |
 
 ---
 
@@ -221,3 +394,9 @@ manager.start  # blocks
 | 4 | Leader Election が動作し、レプリカ増減で reconcile 継続する |
 | 5 | CRD Generator が Ruby クラス → 有効な CRD YAML を出力する |
 | 6 | CLI scaffolding で `init` + `create api` でプロジェクトが立ち上がる |
+| 7 | 注入された client だけで reconcile が cache 読み + API 書き込みを完結できる (F-11/F-12) |
+| 8 | hello-world (CronTask) が kind クラスターで端到端に動作する (Phase 4) |
+| 9 | `/healthz` / `/readyz` が Kubernetes の probe として機能する (F-15) |
+| 10 | reconcile の実行統計が `/metrics` で取得できる (F-23) |
+| 11 | validate / mutate webhook が `AdmissionReview` v1 で応答し、動作する (F-21) |
+| 12 | `init` 生成プロジェクトが `make deploy` (kind) まで通る (F-20) |

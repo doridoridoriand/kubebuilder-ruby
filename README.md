@@ -11,13 +11,31 @@ kubebuilder / controller-runtime のコンセプトを Ruby に移植。
 
 Kubernetes のカスタムリソース (CRD) 用のコントローラーを Ruby で簡潔に書けるフレームワーク。
 
+次は登録とキャッシュ読み取りの最小例です。事前に対象 CRD のインストールと、List / Watch および Lease への RBAC が必要です。リソース作成や status 更新の処理は省略しています。
+
 ```ruby
+require "kruby-controller"
+
+class CronTask
+  include KrubyController::CRD
+  self.group = "stable.example.com"
+  self.version = "v1"
+  self.kind = "CronTask"
+  self.plural = "crontasks"
+end
+
+CRON_TASK_GVK = KrubyController::GVK.new(
+  group: CronTask.group, version: CronTask.version,
+  kind: CronTask.kind, resource: CronTask.plural
+)
+
 class CronTaskReconciler < KrubyController::Reconciler
   def reconcile(request)
-    cron_task = get_cron_task(request.namespace, request.name)
-    job = ensure_job(cron_task)
-    update_status(cron_task, job_status: job.status)
-    KrubyController::Result.retry_after(30)
+    obj = cache.get(CRON_TASK_GVK, request.namespace, request.name)
+    return KrubyController::Result.ok unless obj
+
+    logger.info("Reconciling #{request.namespace}/#{request.name}")
+    KrubyController::Result.ok
   end
 end
 
@@ -28,16 +46,15 @@ manager.start
 
 ## 機能
 
-| 機能 | ステータス |
+| 機能 | 状態 |
 |---|---|
-| Controller Manager | 🚧 Phase 1 |
-| Reconcile Loop | 🚧 Phase 1 |
-| Shared Cache / Informer | 🚧 Phase 1 |
-| Event Handler | 🚧 Phase 1 |
-| Leader Election | 🚧 Phase 1 |
-| CRD Generator | 📅 Phase 2 |
-| CLI Scaffolding | 📅 Phase 3 |
-| Finalizer / OwnerReference | 📅 Phase 2 |
+| Manager / reconcile / shared cache / leader election | 基本実装あり。同期順序や停止処理を含む信頼性の検証・修正が必要 |
+| Event handler / owner reference / finalizer / status | 基本実装あり |
+| CRD Generator / CLI `init`・`create api` | 基本実装あり。一部の schema や deploy 資産は未対応 |
+| 統合 client / イベント記録 / probe / metrics | 未実装 |
+| Webhook / 複数 version の conversion | 未実装 |
+
+実装の有無は本番での検証や Kubebuilder との機能同等性を意味しません。詳細と残課題は[差分評価](docs/design/parity-review.md)を参照してください。
 
 ## ヘルパー (Finalizer / Status)
 
@@ -65,15 +82,7 @@ status.update_status(obj, { "phase" => "Running" })
 
 ## インストール
 
-```bash
-gem install kruby-controller
-```
-
-または Gemfile:
-
-```ruby
-gem "kruby-controller", "~> 0.1"
-```
+初回リリース・公開先は未確定です ([#43](https://github.com/doridoridoriand/kubebuilder-ruby/issues/43))。開発時はこのリポジトリを取得し、`bundle install` を実行してください。
 
 ## 開発
 
@@ -86,6 +95,7 @@ bundle exec rake
 
 - [仕様書](docs/design/specification.md)
 - [設計書](docs/design/design.md)
+- [本家との差分評価](docs/design/parity-review.md)
 
 ## License
 

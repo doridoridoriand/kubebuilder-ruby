@@ -103,6 +103,8 @@ RSpec.describe KrubyController::Controller do
     reconciler.reconciled_names
   end
 
+  before { allow(cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient)) }
+
   after { controller.stop }
 
   describe "#start handler registration" do
@@ -481,6 +483,8 @@ RSpec.describe KrubyController::Builder::ControllerBuilder do
   let(:manager) { KrubyController::Manager.new }
   let(:reconciler) { BuilderSpecReconciler.new }
   let(:informers) { manager.cache.instance_variable_get(:@informers) }
+
+  before { allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient)) }
 
   it "wires owns / watches / predicate / max_concurrent end to end (fluent API)" do
     controller = manager

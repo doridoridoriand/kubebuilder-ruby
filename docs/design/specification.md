@@ -5,8 +5,8 @@
 | 名称 | **Kruby Controller Framework** (コードネーム: `kruby-controller`) |
 | 目的 | kubebuilder 相当のカスタムコントローラー開発フレームワークを Ruby / kruby で提供 |
 | 文書番号 | KRC-SPEC-001 |
-| バージョン | Draft 0.2 |
-| 日付 | 2026-10-30 |
+| バージョン | Draft 0.3 |
+| 日付 | 2026-10-31 |
 | 著者 | Takahiro Ishida / Hermes |
 
 **変更履歴**
@@ -14,6 +14,7 @@
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
+| 0.3 | 2026-10-31 | 本家 v4.16.0 との再評価。実装状況・安全性の矛盾を修正し、追加要件と追跡先を対応表に整理。 |
 | 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 追加 (Phase 5〜9)、O-01〜O-03 の In Scope 昇格、実装状況の明記、NFR・成功基準の追加。レビュー対応: EventRecorder を events.k8s.io/v1 スキーマ準拠に訂正、predicate の互換契約を明示化、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持。再レビュー対応: `/readyz` をスタンバイ Ready 既定に変更 (`ready_gate: :leader` は Recreate 戦略前提)、merge-patch への限定、webhook 例外と明示拒否の分離、定期 resync を predicate 適用前配信に変更 |
 
 ---
@@ -50,7 +51,7 @@ end
 
 # my_controller/manager.rb
 manager = KrubyController::Manager.new(kube_config:)
-manager.add(CronTaskReconciler, for: "CronTask")  # F-12: client / recorder / logger を注入
+manager.add(CronTaskReconciler, for: CronTask)  # F-12: client / recorder / logger を注入
 manager.start  # blocks
 ```
 
@@ -73,12 +74,12 @@ manager.start  # blocks
 | F-07 | CLI Scaffolding | **MUST** | `kruby-controller init`, `kruby-controller create api` |
 | F-08 | Finalizer Management | **SHOULD** | finalizer の追加・削除・クリーンアップを支援 |
 | F-09 | OwnerReference 管理 | **SHOULD** | controllerOf: true / blockOwnerDeletion の自動付与 |
-| F-10 | Status Subresource 支援 | **SHOULD** | status の楽観的排他制御による更新 (three-way merge 相当) |
+| F-10 | Status Subresource 支援 | **SHOULD** | status の楽観的排他制御による更新 (three-way merge は未提供) |
 | F-11 | ControllerClient | **MUST** | cache 読み + API 書き込みを単一の注入オブジェクトに統合 (Phase 5) |
 | F-12 | 依存の自動注入 | **MUST** | Reconciler へ client / cache / api_client / logger / recorder を Manager が注入 (Phase 5) |
 | F-13 | 競合検知つき書き込み | **SHOULD** | resourceVersion による楽観的排他制御、409 (conflict) の再取得リトライ (Phase 5) |
 | F-14 | EventRecorder | **SHOULD** | events.k8s.io/v1 の Kubernetes Events 送出 (Phase 7) |
-| F-15 | Health Probe | **SHOULD** | `/healthz` (生存) / `/readyz` (cache sync、オプションでリーダー状態) エンドポイント (Phase 7) |
+| F-15 | Health Probe | **SHOULD** | `/healthz` (生存) / `/readyz` (リーダーの cache sync、オプションでリーダー状態) エンドポイント (Phase 7) |
 | F-16 | 定期 Resync | **SHOULD** | watch 切断に依らない定期的な再同期 (既定 10h, Phase 6) |
 | F-17 | Predicate 拡張 | **SHOULD** | old/new 付き Update イベント、事前定義 predicate (GenerationChanged 等) (Phase 6) |
 | F-18 | Server-side Selector | **SHOULD** | List/Watch に labelSelector / fieldSelector を渡す (Phase 6) |
@@ -93,7 +94,7 @@ manager.start  # blocks
 
 | ID | 機能 | 備考 |
 |---|---|---|
-| O-04 | Predictive Scaffolding (kubebuilder v4 の Go types から CRD 推論の完全実装) | F-24 は簡易版のみ。完全な型生成・deepcopy 相当は将来検討 |
+| O-04 | Go types / markers と等価な型生成・コード生成 | F-24 は簡易版のみ。完全な型生成・deepcopy 相当は将来検討 |
 | O-05 | Multi-Cluster 対応 | 将来的に検討 |
 
 (0.2 注記: O-01 Validating/Mutating Webhook、O-02 Conversion Webhook、O-03 Metrics は F-21 / F-22 / F-23 として In Scope に昇格した。判断根拠は設計書 §2.17 / §2.19 および設計書 §11 の未確定事項を参照)
@@ -102,14 +103,16 @@ manager.start  # blocks
 
 | F-ID | 状態 | 備考 |
 |---|---|---|
-| F-01 〜 F-05 | 実装済み | Phase 1〜3 (PR #18〜#29 含む)。#24〜#29 で信頼性強化済み |
+| F-01 〜 F-05 | 一部実装済み | Phase 1〜3 の基本機能あり。動作保証・本家同等性は未検証、残課題は [差分評価](./parity-review.md) を参照 |
 | F-06 | 実装済み (一部未対応) | additionalPrinterColumns は未対応 → F-19 (Phase 8)、issue #15 |
-| F-07 | 実装済み | PR #28。Makefile/Dockerfile 等の拡張は F-20 (Phase 8) |
+| F-07 | 基本機能のみ実装済み | PR #28。Makefile/Dockerfile 等の拡張は F-20 (Phase 8) |
 | F-08 〜 F-09 | 実装済み | PR #22 |
-| F-10 | 実装済み (一部未対応) | merge-patch のみ。楽観的排他制御 (three-way) は F-13 (Phase 5) |
+| F-10 | 実装済み (一部未対応) | merge-patch のみ。楽観的排他制御は F-13 (Phase 5)、three-way merge は未提供 |
 | F-11 〜 F-24 | 未実装 | Phase 5 〜 9 |
 
 ---
+
+本家との比較対象、実装済み・未検証・未着手の区別、および追加要件・Issue は [差分評価](./parity-review.md) を参照。F-01〜F-24 と Phase 9 の完了のみでは本家全体との同等性を意味しない。
 
 ## 3. 要件
 
@@ -229,8 +232,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-13 |
 | 説明 | update / patch_status における optimistic concurrency control (F-10 の強化) |
-| 仕様 | `update` は resourceVersion を保持して PUT。409 (conflict) → サーバーから再取得 → 最大 5 回再適用。上限超過は `KrubyController::ConflictError` を raise (Controller の指数バックオフに合流)。`patch` / `patch_status` も merge-patch ボディに `metadata.resourceVersion` を含めて競合検知する |
-| 制約 | 全体 PUT の再適用は同時更新を握り潰しうるため、頻繁に同時更新されるフィールドは patch (merge) を推奨 (merge-patch は対象フィールドのみ更新し、RV による競合検知が効く) |
+| 仕様 | `update` は resourceVersion を保持して PUT。409 (conflict) は既定で呼び出し元に返す。再試行は API からの再取得後に呼び出し元が意図を再計算する明示的なブロックでのみ行う。`patch` / `patch_status` は必要に応じて merge-patch ボディに `metadata.resourceVersion` を含めて競合検知する |
+| 制約 | 古い PUT や patch を新しい resourceVersion に差し替えて自動再送しない。merge patch も同じフィールドの競合は自動解決できない |
 
 #### FR-14: EventRecorder
 
@@ -247,8 +250,8 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-15 |
 | 説明 | liveness / readiness 用 HTTP エンドポイント |
-| 仕様 | `/healthz` は常時 200 (プロセス生存)。`/readyz` は既定「全 informer synced」で 200 (リーダー非取得のスタンバイも Ready — RollingUpdate と両立)。`ready_gate: :leader` で「リーダー取得済みのみ 200」に変更可 (その場合は Deployment を Recreate 戦略にする必要がある) |
-| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081", ready_gate: :default | :leader)`。nil で無効 |
+| 仕様 | `/healthz` は常時 200 (プロセス生存)。`/readyz` は既定で初期化済みかつ (スタンバイ、またはリーダーで必要な informer が同期済み) なら 200。キャッシュは現行どおりリーダー取得後に起動する。リーダーへの昇格中は同期完了まで 503。`ready_gate: :leader` で「リーダー取得済みかつ cache 同期済みの場合のみ 200」に変更可 (その場合は Deployment を Recreate 戦略にする必要がある) |
+| 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081", ready_gate: :default または :leader)`。nil で無効 |
 
 #### FR-16: 定期 Resync
 
@@ -256,7 +259,7 @@ manager.start  # blocks
 |---|---|
 | 識別子 | FR-16 |
 | 説明 | watch 切断に依らない定期的な再同期 (controller-runtime SyncPeriod 相当) |
-| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに、キャッシュ済みの全オブジェクトを合成 delta として handler に再配信する (API List なし。resourceVersion 変化の有無に依らず再配信)。合成 delta は predicate 適用前に配信する。watch 切断時の relist (新鮮な List + 差分配信) は従来どおり |
+| 仕様 | Informer が `resync_period` (既定 10h, 0/nil で無効) ごとに、キャッシュ済みの全オブジェクトを合成 delta として handler に再配信する (API List なし。resourceVersion 変化の有無に依らず再配信)。合成 Update は通常の predicate を通す。GenerationChanged 等で拒否される場合は、定期実行が必要な reconcile で retry_after を用いる。watch 切断時の relist (新鮮な List + 差分配信) は従来どおり |
 | 制約 | 配信負荷はオブジェクト数に比例する (API 負荷ではない)。大規模キャッシュでは resync_period の引き上げを推奨 |
 
 #### FR-17: Predicate 拡張
@@ -275,7 +278,7 @@ manager.start  # blocks
 | 識別子 | FR-18 |
 | 説明 | Informer の List/Watch に labelSelector / fieldSelector を渡す |
 | 仕様 | `register(gvk:, label_selector:, field_selector:)` → List/Watch URL に付与。watch 切断時の relist も同一条件 (定期 resync は既存ストアの再配信であり再取得は行わない) |
-| 制約 | ストアは「セレクタに合致する集合」を保持。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ) |
+| 制約 | ストアは「セレクタに合致する集合」を保持。合致 → 非合致の遷移は選択集合からの削除として処理し、非合致の間の変更・削除は観測できない。List/Watch の遅延・再接続中は一時的に古い |
 
 #### FR-19: CRD DSL 検証制約
 
@@ -284,7 +287,7 @@ manager.start  # blocks
 | 識別子 | FR-19 |
 | 説明 | attribute DSL に OpenAPI v3 の検証制約と printer columns を追加 |
 | 仕様 | `minimum` / `maximum` / `minLength` / `maxLength` / `pattern` / `format` / `nullable`、`printer_column :name, json_path:, type:` |
-| 制約 | issue #15 残部 (複数形化 / shortNames は実装済み) |
+| 制約 | issue #15 は複数形化 / shortNames の実装後もオープン。高度な schema は [差分評価](./parity-review.md) を参照 |
 
 #### FR-20: Scaffold 完全化
 
@@ -293,7 +296,7 @@ manager.start  # blocks
 | 識別子 | FR-20 |
 | 説明 | init / create api が kubebuilder 相当のビルド・デプロイ資産を生成 |
 | 仕様 | Makefile (install/run/manifests/build/docker-build/docker-push/deploy/undeploy/test)、Dockerfile、Kustomize 構成 (config/{crd,rbac,manager,default})、config/samples、.github/workflows CI、.dockerignore |
-| 制約 | RBAC の使用 API からの自動生成 (marker 相当) は簡易対応にとどめる (O-04) |
+| 制約 | 明示的な権限宣言からの RBAC 生成は別途追跡する ([差分評価](./parity-review.md)) |
 
 #### FR-21: Validating / Mutating Webhook
 

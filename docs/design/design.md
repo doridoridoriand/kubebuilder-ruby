@@ -5,14 +5,15 @@
 | 名称 | **Kruby Controller Framework** (gem 名: `kruby-controller`) |
 | 文書番号 | KRC-DES-001 |
 | 仕様書参照 | [specification.md](./specification.md) |
-| バージョン | Draft 0.2 |
-| 日付 | 2026-10-30 |
+| バージョン | Draft 0.3 |
+| 日付 | 2026-10-31 |
 
 **変更履歴**
 
 | 版 | 日付 | 変更 |
 |---|---|---|
 | 0.1 | 2026-06-10 | 初版 |
+| 0.3 | 2026-10-31 | 本家 v4.16.0 との再評価。実装状況・安全性の矛盾を修正し、追加要件と追跡先を対応表に整理。 |
 | 0.2 | 2026-10-30 | kubebuilder 差分分析に基づく増補: F-11〜F-24 (Phase 5〜9) の設計追記 (§2.12〜§2.19)、実施順序の明記、未確定事項 (§11)、対応表 / kruby 依存 / エラーハンドリング / テスト戦略の更新。レビュー対応: events.k8s.io/v1 のフィールド名訂正 (regarding / note / reportingController / eventTime)、predicate 互換契約の明示化 (arity 判定の廃止)、定期 resync をキャッシュ全件の合成再配信に変更、merge-patch への resourceVersion 保持。再レビュー対応: handler の新形式判定を `method(:handle).parameters` に変更 (2 引数互換を維持)、`/readyz` をスタンバイ Ready 既定に変更 (`ready_gate: :leader` は Recreate 戦略前提)、merge-patch への限定 (json-patch は operations 別契約で将来対応)、webhook 例外 (HTTP 5xx) と明示拒否 (`allowed: false`) の分離、定期 resync を predicate 適用前配信に変更、events v1 必須フィールドの明記 |
 
 ---
@@ -228,62 +229,15 @@ end
 
 #### 内部アーキテクチャ
 
-```ruby
-# Manager の内部構造
-class Manager
-  attr_reader :cache, :stop_channel, :leader_elector
+以下は修正後の起動・停止契約であり、現行コードの実装完了を示さない (#52 / #53)。
 
-  def initialize(opts)
-    @cache = SharedCache.new(kube_config: opts[:kube_config])
-    @controllers = []
-    @leader_elector = opts[:leader_elect] ?
-      LeaderElector.new(**leader_opts) : nil
-    @stop_channel = Channel.new
-    @running = false
-  end
+1. signal を安全に受け取る停止経路と補助サーバーを初期化し、controller の informer / handler を登録する。
+2. leader election 有効時は standby として待機し、リーダー取得後に cache を開始する。無効時は直ちに cache を開始する。
+3. 全 informer の初回同期完了を待つ。同期失敗・timeout・停止・リーダー喪失時は worker を開始しない。
+4. 同期後に reconcile worker を開始する。同期中に queue に入った初回イベントを保持する。
+5. いずれのモードでも `start` は停止まで待機する。停止処理は trap 内で mutex を直接操作せず、期限内に各コンポーネントを停止する。
 
-  def add(reconciler_class, **opts)
-    controller = Controller.new(
-      reconciler: reconciler_class.new,
-      cache: @cache,
-      **opts
-    )
-    @controllers << controller
-  end
-
-  def start
-    @running = true
-
-    # 1. shared cache を起動 (background thread)
-    @cache.start
-
-    # 2. cache sync を待機
-    @cache.wait_for_sync
-
-    # 3. leader election (もし有効なら)
-    start_leader_election if @leader_elector
-
-    # 4. コントローラーをスレッドで起動
-    @controllers.each do |ctrl|
-      Thread.new { ctrl.start }
-    end
-
-    # 5. sigterm/sigint で graceful stop
-    trap_sigterm { stop }
-
-    # 6. block until stop
-    @stop_channel.receive
-  end
-
-  def stop(timeout:)
-    @running = false
-    @stop_channel.send(:stop)
-    @cache.stop
-    @controllers.each { |c| c.stop(timeout:) }
-    @leader_elector&.release
-  end
-end
-```
+readiness の standby / 昇格中の扱いは §2.16 を参照。失敗時の再起動・継続方針、期限超過時の挙動は #37 / #52 / #53 の検証時に確定する。
 
 ---
 
@@ -1125,7 +1079,7 @@ class KrubyController::Status::StatusUpdater
 end
 ```
 
-**0.2 追記**: Phase 5 (F-11/F-13) 以降は、`client:` に §2.12 の `ControllerClient` を渡すことで `update` / `patch_status` に 409 競合リトライ (楽観的排他制御) を導入できる。`KubernetesObjectClient` は後方互換のため残存するが、新規コードでの利用は非推奨とする。
+**0.2 追記**: Phase 5 (F-11/F-13) 以降は、`client:` に §2.12 の `ControllerClient` を渡すことで `update` / `patch_status` に resourceVersion による競合検知を導入できる。再試行は §2.12.3 に従い変更を再計算する。`KubernetesObjectClient` は後方互換のため残存するが、新規コードでの利用は非推奨とする。
 
 ---
 
@@ -1147,7 +1101,7 @@ class KrubyController::Client::ControllerClient
 
   # --- write (ApiClient#build_request で直接構築) ---
   def create(obj)                 # POST collection path
-  def update(obj)                 # PUT object path。409 → 再取得 → 最大 5 回 (F-13)
+  def update(obj)                 # PUT object path。409 → ConflictError (F-13)
   def patch(obj)                  # PATCH merge-patch+json。ボディに metadata.resourceVersion を含める (競合検知)。json-patch は Phase 5 対象外 (§2.12.3 参照)
   def delete(obj)                 # DELETE object path
   def patch_status(obj, status_patch = nil)  # PATCH {object_path}/status (merge-patch)
@@ -1177,13 +1131,9 @@ Manager#add
 
 #### 2.12.3 競合検知 (F-13)
 
-| 挙動 | 設計 |
-|---|---|
-| update | obj の `metadata.resourceVersion` を伴って PUT。409 Conflict → サーバーから再取得 → 再 PUT。最大 5 回、上限で `KrubyController::ConflictError` を raise |
-| patch / patch_status | merge-patch ボディに `metadata.resourceVersion` を含める (キャッシュ / 直前取得の値)。apiserver は適用後の RV を検証し、不一致を 409 として返すため、merge-patch でも競合検知が効く。409 → 再取得 → 再適用 (最大 5 回)。Phase 5 では merge-patch のみを提供し、json-patch は対象外とする (JSON Patch はオブジェクト本文ではなく operations 配列を要求するため、同じ本文への RV 追加は不正リクエストになる。将来提供する場合は `patch_json(obj, operations)` として契約を分け、競合検知は `/metadata/resourceVersion` への `test` 操作で定義する) |
-| 409 リトライの位置づけ | reconcile のエラーにはしない (ControllerClient 内で完結)。上限超過のみエラー化 → Controller の指数バックオフに自然合流 |
-
-注意: 全体 PUT の再適用は、再取得後のオブジェクトを送信するため、リトライ間の同時更新を握り潰しうる。merge-patch は対象フィールドのみ更新するためこのリスクが低く、かつ RV による競合検知が効く。同時更新が想定されるフィールドは `patch` / `patch_status` を推奨する。
+- PUT は取得時の `metadata.resourceVersion` を使い、競合時は `ConflictError` として返す。無条件の古いオブジェクト再送や resourceVersion の付け替えを行わない。
+- merge patch / status patch の競合検知を要求する場合は `metadata.resourceVersion` を含め、409 を返す。JSON Patch は operations と `test` の契約を別途定義する。
+- 自動リトライを提供する場合、API サーバーから再取得した最新オブジェクトに対し、呼び出し元の変更処理を毎回再実行する明示的なブロック API とし、回数・バックオフ・削除時の挙動を定義する。副作用はブロック外に置く。異なるフィールドの保持と同一フィールド競合を実 API で検証する。
 
 ### 2.13 キャッシュ拡張: Resync / Server-side Selector / Field Index (F-16 / F-18 / issue #16)
 
@@ -1191,14 +1141,14 @@ Manager#add
 
 - Informer に timer スレッドを追加し、`resync_period` 秒ごとに **ストア内の全オブジェクトを合成 delta として handler に再配信する** (client-go の resync 相当)。§2.3.2 の relist が発行するのは「差分だけのイベント」(resourceVersion が変わっていないオブジェクトにはイベントが飛ばない) のため、relist 差分を流用した定期同期では外部状態のドリフトを修復できない。resync は API List を伴わないローカル処理とし、全オブジェクトを無条件に再配信する。
 - 既定値: 10h (controller-runtime SyncPeriod 相当)。`Manager.new(resync_period:)` → SharedCache → Informer へ伝播。`0` / `nil` で無効。
-- 合成 delta は predicate 適用前に配信する (§2.14): `Predicated` をバイパスして下位 handler に直接渡すため、GenerationChanged 系 predicate を設定していてもドリフト修復の reconcile が失われない (predicate は watch イベントのフィルタ用途とする)。
+- 合成 Update は old/new に同じスナップショットを指定し、通常の predicate を通す。GenerationChanged 等で拒否される場合、外部状態の定期確認には `retry_after` を使う。これは controller-runtime の SyncPeriod の意味論に合わせる。
 - watch 切断時の relist (新鮮な List + 差分配信) は従来どおり維持する。relist は watch スレッド上で `watch_once` が終了した後にのみ実行されるため、watch 中の delta と relist snapshot の競合 (古い List でストア / resourceVersion を巻き戻す) は発生しない。Phase 6 実装でも relist を timer スレッドから直接呼ばないこと。
 - 負荷特性は §9.5 参照。
 
 #### 2.13.2 Server-side Selector (F-18)
 
 - `register(gvk:, label_selector:, field_selector:)` を追加し、List / Watch URL に `labelSelector` / `fieldSelector` を URL エンコードして付与する。
-- watch 切断時の relist も同一条件で再取得するため、ストアは常に「セレクタに合致する集合」を保つ。合致しないオブジェクトの削除は通知されない (kubebuilder 同様のトレードオフ)。定期 resync (§2.13.1) は既存ストアの再配信であり、再取得は行わない。
+- watch 切断時の relist も同一条件で再取得するため、ストアは同期後に選択集合に収束する。合致から非合致への変更は削除イベントとして扱い、非合致中の変更・削除は観測できない。接続断・処理遅延中の即時整合性は保証しない。定期 resync (§2.13.1) は既存ストアの再配信であり、再取得は行わない。
 - 既存 `SharedCache#list` のクライアント側フィルタは残置 (後方互換) し、サーバー側フィルタを第一に使う。
 
 #### 2.13.3 Field Index (issue #16, §2.3.1 で既に定義)
@@ -1267,8 +1217,8 @@ recorder = manager.recorder_for("cron-task")
 
 | 項目 | 設計 |
 |---|---|
-| エンドポイント | `GET /healthz` (プロセス生存: 常時 200) / `GET /readyz` — 既定は「全 informer synced」で 200 (リーダー有無は不問: スタンバイ Pod も Ready にする)。`ready_gate: :leader` オプションで「リーダー取得済みのみ 200」に変更できる |
-| readyz の意味論 | スタンバイ Ready を既定にする。リーダーのみ Ready にすると、RollingUpdate の単一レプリカ構成では「新 Pod がリース待ちで Ready にならない ↔ Kubernetes が新 Pod の Ready を待って旧 Pod を終了しない」のデッドロックでロールアウトが停止する。リーダーのみ Ready を使う場合は Deployment を Recreate 戦略にする必要がある |
+| エンドポイント | `GET /healthz` (プロセス生存: 常時 200) / `GET /readyz` — 既定は初期化済みかつ (スタンバイ、またはリーダーで全 informer synced) なら 200。昇格時は同期完了まで 503。`ready_gate: :leader` オプションで「リーダー取得済みかつ cache 同期済みの場合のみ 200」に変更できる |
+| readyz の意味論 | キャッシュはリーダー取得後に開始する現行方式を維持し、待機中は同期済みを要求しない。失敗・停止中は 503。スタンバイ Ready を既定にする。リーダーのみ Ready にすると、RollingUpdate の単一レプリカ構成では「新 Pod がリース待ちで Ready にならない ↔ Kubernetes が新 Pod の Ready を待って旧 Pod を終了しない」のデッドロックでロールアウトが停止する。リーダーのみ Ready を使う場合は Deployment を Recreate 戦略にする必要がある |
 | 実装 | 依存追加なしの軽量 HTTP サーバー (TCPServer + accept スレッド、GET のみ)。WEBrick は Ruby 3.0+ で bundled gem 化しており、依存追加を避ける (§9.6) |
 | 設定 | `Manager.new(health_bind_address: "0.0.0.0:8081")` / `nil` で無効 |
 | 起動 | Manager#start で非ブロック起動、stop 時に確実に閉じる (NFR-10) |
@@ -1282,7 +1232,7 @@ recorder = manager.recorder_for("cron-task")
 | エンドポイント | `GET /metrics` — `metrics_bind_address` (既定 nil = 無効) |
 | 指標 | `controller_reconcile_total{controller,result}` (ok / error / requeue / retry)、`controller_reconcile_duration_seconds` (histogram)、`workqueue_depth{controller}`、`workqueue_queue_duration_seconds` (histogram)、`leader_elected` (gauge) |
 | 実装方式 | Q1: `prometheus_client` gem を依存追加するか、テキスト形式を自前実装するか (依存最小方針と天秤)。Phase 7 設計時に決定 |
-| 基盤 | Probe (§2.16) と同一の軽量 HTTP サーバーを共用 |
+| 基盤 | Probe (§2.16) とはアクセス制御を分離する。ネットワーク公開時は TLS + 認証・認可を必須とし、未保護の有効化は明示的な選択とする。詳細は [差分評価](./parity-review.md) |
 
 ### 2.18 Scaffolding 完全化 + CRD DSL 拡張 (F-19 / F-20 / F-24)
 
@@ -1299,7 +1249,7 @@ recorder = manager.recorder_for("cron-task")
 | `config/samples/<group>_<plural>_sample.yaml` | `create api` がサンプルを生成 |
 | `.github/workflows/ruby.yml` | rubocop + rspec の CI |
 
-`create api` も Kustomize 構成への CRD / RBAC 追記に対応する。RBAC の「使用 API からの自動生成」(+kubebuilder:rbac 相当) は簡易対応にとどめ、完全な marker 相当は将来検討 (O-04)。
+`create api` も Kustomize 構成への CRD / RBAC 追記に対応する。RBAC は使用 API の推測ではなく明示的宣言から Role / ClusterRole を生成することを別途追跡する ([差分評価](./parity-review.md))。
 
 #### 2.18.2 CRD DSL 検証制約 (F-19, issue #15 残部)
 
@@ -1320,7 +1270,7 @@ printer_column :priority, json_path: ".spec.priority", type: :string
 #### 2.18.3 Typed Resource Accessor (F-24, O-04 の簡易版)
 
 - CRD DSL から `define_method` で spec / status パスの読み取りアクセサを生成する (`cron_task.spec.schedule` 等)。内部データは Hash のまま保持する。
-- Go 相当の完全な型生成・deepcopy は不要 (Ruby では参照共有で十分)。schema 定義と実データの乖離チェックは scope 外。
+- 型生成の完全互換は対象外。ただしキャッシュ内の可変 Hash の参照共有は危険なため、読み出し側に独立したスナップショットを返す。schema 定義と実データの乖離チェックは別途検討する。
 
 ### 2.19 Webhook (F-21 / F-22, 旧 O-01 / O-02)
 
@@ -1468,13 +1418,13 @@ Main Thread
 | シナリオ | 対応 |
 |---|---|
 | reconcile で例外 | ログ出力 + `Result.retry_after(5)` で再試行 (指数バックオフ, max 5min) |
-| Watch 切断 | sleep(背off) 後、直前 resourceVersion から再 connect |
-| List 失敗 (初回 sync) | 3 回リトライ → Manager startup 失敗 |
+| Watch 切断 | バックオフ後に relist し、List の resourceVersion から Watch 再開。ERROR / BOOKMARK は #45 |
+| List 失敗 (初回 sync) | 最大 4 回試行後 Manager startup 失敗 |
 | API 404 (リソース削除済み) | reconcile で `Result.ok` (no-op) |
 | API 429 (throttled) | `retry_after` で待機 |
-| API 409 (conflict) | 再取得 → 再適用 (update loop)。F-13 以降は ControllerClient が最大 5 回自動リトライ |
+| API 409 (conflict) | 呼び出し元へ返す。再試行は最新状態から意図を再計算する明示的ブロックで行う (§2.12.3) |
 | Leader election 失敗 | リード候補外 → reconcile 一時停止 → 再取得時再開 |
-| ControllerClient update で 409 (連続) | 再取得 → 最大 5 回再適用 → 上限で `ConflictError` を raise (指数バックオフに合流) |
+| ControllerClient update で 409 | `ConflictError` を返す。未処理なら Controller の指数バックオフに合流 |
 | EventRecorder 送信失敗 | ログのみ (reconcile に影響させない) |
 | Probe / Metrics の bind 失敗 | Manager 起動失敗 (設定エラーとして表面化) |
 | Webhook validate 例外 | HTTP 5xx 応答 → failurePolicy に従う (Fail → deny / Ignore → 許可)。明示的な検証 NG (`allowed: false` + status) は failurePolicy をバイパスする — 両者を混同しない |
@@ -1573,11 +1523,11 @@ Main Thread
 | フレームワーク側 | kruby 側 | 用途 |
 |---|---|---|
 | `Manager#initialize(kube_config:)` | `Kubernetes::Configuration`, `Kubernetes::KubeConfig` | 認証設定 |
-| `Informer#populate` | `Kubernetes::ApiClient#get` | 初回 List |
+| `Informer#populate` | `Kubernetes::ApiClient#build_request` | 初回 List |
 | `Informer#watch_loop` | `Kubernetes::Watch` | Watch 接続 |
 | `CRD Generator` | `Kubernetes::ApiExtensionsV1Api` | CRD apply |
 | `LeaderElector` | `Kubernetes::CoordinationV1Api` | Lease API |
-| `StatusUpdater` | `Kubernetes::CustomObjectsApi` (patch_status 相当) | Status PATCH |
+| `StatusUpdater` | `KubernetesObjectClient` / `ApiClient#build_request` | Status PATCH |
 | `Reconciler` | 各種 `Kubernetes::*Api` | API 操作 |
 | `ControllerClient` (F-11) | `Kubernetes::ApiClient#build_request` | PUT / PATCH / POST / DELETE を直接構築 (kruby CustomObjectsApi には PUT update / merge-patch が無いため) |
 | `EventRecorder` (F-14) | `Kubernetes::ApiClient#build_request` | events.k8s.io/v1 の送出 |
@@ -1590,6 +1540,8 @@ Main Thread
 ---
 
 ## 8. 既存 kubebuilder との対応表
+
+以下は概念の対応であり同等性・実装完了を示さない。評価時点、差分、受け入れ基準、Issue は [差分評価](./parity-review.md) を正とする。
 
 | kubebuilder / controller-runtime | Kruby Controller Framework | 備考 |
 |---|---|---|

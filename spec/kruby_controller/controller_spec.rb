@@ -125,6 +125,32 @@ RSpec.describe KrubyController::Controller do
     end
   end
 
+  describe "re-registration (leadership reacquisition)" do
+    it "reopens a shut-down queue before resyncing so the diff is buffered" do
+      controller.start
+      controller.stop
+
+      # Back to leading: handlers are already registered (register is a
+      # no-op) and the restarted cache emits its initial List diff while the
+      # workers are still down. The queue must accept those events again.
+      controller.register
+      handlers_for(BuilderSpecCronTaskGVK).each do |h|
+        h.handle(KrubyController::Cache::Delta::ADDED,
+                 { "metadata" => { "namespace" => "default", "name" => "cron-2" } })
+      end
+      controller.start
+
+      expect(wait_until_reconciled(["default/cron-2"], timeout: 5)).to include("default/cron-2")
+    end
+
+    it "does not duplicate handlers across re-registrations" do
+      controller.register
+      controller.register
+
+      expect(handlers_for(BuilderSpecCronTaskGVK).size).to eq(1)
+    end
+  end
+
   describe "owns:" do
     let(:controller) do
       described_class.new(reconciler: reconciler, cache: cache, for_gvk: BuilderSpecCronTaskGVK,

@@ -153,10 +153,12 @@ module KrubyController
       # that fails outright: fail startup (stopping the components we just
       # started) instead of running controllers against an empty/stale cache.
       synced = @cache.wait_for_sync
-      if @stopped
-        # A stop raced in during the sync wait. stop() may have run before
-        # some components were started; sweep them again. Workers must not
-        # start against a stopped manager.
+      if @stopped || !leader?
+        # A stop raced in during the sync wait, or leadership was lost while
+        # the cache was syncing (the elector flags the loss before its
+        # on_stopped_leading cleanup runs). stop() may already have stopped
+        # the components; stop_components is idempotent. Workers must never
+        # start without the lease or on a stopped manager.
         stop_components
         return
       end

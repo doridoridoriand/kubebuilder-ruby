@@ -15,11 +15,11 @@ class GvkSpecCronTask
   def self.namespaced = true
 end
 
-# Records each reconcile with whether the watched informer was synced at
-# that moment, so the manager specs can assert that no reconcile ran
-# against a partially synced cache.
+# Records each reconcile with the cache-sync state and leadership state at
+# that moment, so the manager specs can assert that no reconcile ran against
+# a partially synced cache or without the lease.
 class SyncGateSpecReconciler < KrubyController::Reconciler
-  attr_accessor :watched_informer
+  attr_accessor :watched_informer, :manager
 
   def initialize
     @mutex = Mutex.new
@@ -28,7 +28,11 @@ class SyncGateSpecReconciler < KrubyController::Reconciler
 
   def reconcile(request)
     @mutex.synchronize do
-      @reconciled << [request.namespaced_name.to_s, watched_informer&.synced]
+      @reconciled << {
+        name: request.namespaced_name.to_s,
+        other_synced: watched_informer&.synced,
+        leader: manager&.leader?
+      }
     end
     KrubyController::Result.ok
   end
@@ -256,8 +260,8 @@ RSpec.describe KrubyController::Manager do
 
       # After the sync completes, the initial objects are processed and every
       # reconcile observed a fully synced cache.
-      expect(reconciler.reconciled.map(&:first)).to contain_exactly("default/cron-1", "default/w-1")
-      expect(reconciler.reconciled.map(&:last)).to all(be(true))
+      expect(reconciler.reconciled.map { |r| r[:name] }).to contain_exactly("default/cron-1", "default/w-1")
+      expect(reconciler.reconciled.map { |r| r[:other_synced] }).to all(be(true))
       expect(informer_crontask.synced).to be(true)
       expect(informer_widget.synced).to be(true)
     ensure
@@ -295,6 +299,98 @@ RSpec.describe KrubyController::Manager do
 
       expect(controller).not_to have_received(:register)
       expect(manager.cache).not_to have_received(:start)
+    end
+
+    it "does not start workers when leadership is lost during the sync wait" do
+      manager = described_class.new(leader_elect: true)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+      allow(manager.cache).to receive(:wait_for_sync).and_return(true)
+      # The elector flags the loss (leader? -> false) before its
+      # on_stopped_leading cleanup runs; the sync wait itself may still
+      # complete successfully.
+      allow(manager).to receive(:leader?).and_return(false)
+
+      expect { manager.send(:start_and_sync) }.not_to raise_error
+
+      expect(controller).to have_received(:register).once
+      expect(controller).not_to have_received(:start)
+      expect(controller).to have_received(:stop).at_least(:once)
+    end
+
+    it "starts workers when leadership is still held after the sync wait" do
+      manager = described_class.new(leader_elect: true)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+      allow(manager.cache).to receive(:wait_for_sync).and_return(true)
+      allow(manager).to receive(:leader?).and_return(true)
+
+      expect { manager.send(:start_and_sync) }.not_to raise_error
+
+      expect(controller).to have_received(:register).once
+      expect(controller).to have_received(:start).once
+    end
+
+    it "buffers resync events emitted during the reacquisition sync wait" do
+      manager = described_class.new(leader_elect: true, retry_period: 0.01)
+      lease = Kubernetes::V1Lease.build_from_hash(
+        metadata: { name: "test-lock", namespace: "kube-system" },
+        spec: { leaseDurationSeconds: 15 }
+      )
+      client = double("coordination client", read_namespaced_lease: lease, replace_namespaced_lease: lease)
+      allow(manager).to receive(:coordination_client).and_return(client)
+      allow(manager).to receive(:setup_signal_handlers)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      # A parked watch thread cannot be interrupted; keep the bounded join
+      # from inflating the spec when the informer is stopped between
+      # leadership generations.
+      stub_const("KrubyController::Cache::Informer::STOP_JOIN_TIMEOUT", 0.05)
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      # Park the watch in connect so no relist races the lifecycle handover;
+      # events flow only through the initial List of each generation.
+      allow(fake_watch).to receive(:connect) { sleep }
+
+      informer = manager.cache.register(gvk: crontask_gvk)
+      current = { "items" => [{ "metadata" => { "namespace" => "default", "name" => "cron-1" } }],
+                  "metadata" => { "resourceVersion" => "1" } }
+      allow(informer).to receive(:fetch_list) { current }
+
+      reconciler = SyncGateSpecReconciler.new
+      reconciler.watched_informer = informer
+      reconciler.manager = manager
+      manager.add(reconciler, for: crontask_gvk)
+
+      runner = Thread.new { manager.start }
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.reconciled.any? { |r| r[:name] == "default/cron-1" } || Time.now >= deadline
+      expect(reconciler.reconciled.map { |r| r[:name] }).to eq(["default/cron-1"])
+
+      # Simulate a leadership takeover: another identity holds the lease.
+      lease.spec.holder_identity = "other-pod"
+      deadline = Time.now + 5
+      sleep 0.05 until !manager.leader? || Time.now >= deadline
+      expect(manager.leader?).to be(false)
+      expect(reconciler.reconciled.map { |r| r[:name] }).to eq(["default/cron-1"])
+
+      # Leadership is reacquired. The resync observes an object created while
+      # this instance was leaderless; its diff is emitted while workers are
+      # still down, so the queue must accept it (register reopens the
+      # lifecycle-closed queue before the cache restarts).
+      lease.spec.holder_identity = nil
+      current = { "items" => [
+        { "metadata" => { "namespace" => "default", "name" => "cron-1" } },
+        { "metadata" => { "namespace" => "default", "name" => "cron-2" } }
+      ], "metadata" => { "resourceVersion" => "2" } }
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.reconciled.any? { |r| r[:name] == "default/cron-2" } || Time.now >= deadline
+
+      expect(reconciler.reconciled.map { |r| r[:name] }).to contain_exactly("default/cron-1", "default/cron-2")
+      expect(reconciler.reconciled.map { |r| r[:other_synced] }).to all(be(true))
+      expect(reconciler.reconciled.map { |r| r[:leader] }).to all(be(true))
+      expect(informer.synced).to be(true)
+    ensure
+      manager&.stop
     end
   end
 end

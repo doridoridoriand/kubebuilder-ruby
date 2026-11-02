@@ -21,12 +21,13 @@ module KrubyController
       @reconciler.logger = KrubyController.logger
     end
 
-    # Registers informer handlers without starting workers. The Manager
-    # calls this before the cache is started, so the initial List events
-    # are captured into the work queue while the cache syncs and are
-    # replayed once workers start; nothing is lost and no reconcile runs
-    # against a partially synced cache (FR-03).
+    # Reopens the queue from a previous lifecycle BEFORE the registration
+    # guard: on leadership reacquisition the handlers are already registered
+    # (this method is a no-op) and the restarted cache emits its initial List
+    # diff while workers are still down, so the queue must accept events
+    # again or the changes observed while leaderless are silently dropped.
     def register
+      @queue.reset if @queue.shutdown?
       return if @handler_registered
 
       informer = @cache.register(gvk: @for_gvk)
@@ -53,7 +54,6 @@ module KrubyController
     def start
       register
       @running = true
-      @queue.reset if @queue.shutdown?
       @workers = (1..@max_concurrent).map do |i|
         Thread.new do
           KrubyController.logger.info("Controller #{@name} worker #{i} started")

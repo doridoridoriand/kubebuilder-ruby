@@ -15,6 +15,29 @@ class GvkSpecCronTask
   def self.namespaced = true
 end
 
+# Records each reconcile with whether the watched informer was synced at
+# that moment, so the manager specs can assert that no reconcile ran
+# against a partially synced cache.
+class SyncGateSpecReconciler < KrubyController::Reconciler
+  attr_accessor :watched_informer
+
+  def initialize
+    @mutex = Mutex.new
+    @reconciled = []
+  end
+
+  def reconcile(request)
+    @mutex.synchronize do
+      @reconciled << [request.namespaced_name.to_s, watched_informer&.synced]
+    end
+    KrubyController::Result.ok
+  end
+
+  def reconciled
+    @mutex.synchronize { @reconciled.dup }
+  end
+end
+
 RSpec.describe KrubyController::Manager do
   let(:manager) { described_class.new }
   let(:controllers) { manager.instance_variable_get(:@controllers) }
@@ -164,18 +187,114 @@ RSpec.describe KrubyController::Manager do
       client = double("coordination client", read_namespaced_lease: lease, replace_namespaced_lease: lease)
       allow(manager).to receive(:coordination_client).and_return(client)
       allow(manager).to receive(:setup_signal_handlers)
-      controller = instance_double(KrubyController::Controller, start: nil, stop: nil)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
       manager.instance_variable_get(:@controllers) << controller
       allow(manager.cache).to receive(:wait_for_sync).and_return(false)
 
       expect { Timeout.timeout(3) { manager.start } }.to raise_error(KrubyController::Error, /did not sync/)
 
-      expect(controller).to have_received(:start).once
+      # Workers must never start against a cache that did not sync (FR-03):
+      # only registration happens before the sync wait.
+      expect(controller).to have_received(:register).once
+      expect(controller).not_to have_received(:start)
       expect(controller).to have_received(:stop).at_least(:once)
       expect(manager.leader?).to be false
       expect(lease.spec.holder_identity).to be_nil
     ensure
       manager&.stop
+    end
+  end
+
+  describe "worker start after cache sync (#52)" do
+    let(:crontask_gvk) do
+      KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask", resource: "crontasks")
+    end
+    let(:widget_gvk) do
+      KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "Widget", resource: "widgets")
+    end
+
+    it "starts workers only after every informer is synced (FR-03)" do
+      manager = described_class.new(leader_elect: false)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
+
+      informer_crontask = manager.cache.register(gvk: crontask_gvk)
+      informer_widget = manager.cache.register(gvk: widget_gvk)
+      allow(informer_crontask).to receive(:fetch_list).and_return(
+        { "items" => [{ "metadata" => { "namespace" => "default", "name" => "cron-1" } }],
+          "metadata" => { "resourceVersion" => "1" } }
+      )
+      gate = ::Queue.new
+      widget_list_started = { value: false }
+      allow(informer_widget).to receive(:fetch_list) do
+        widget_list_started[:value] = true
+        gate.pop
+        { "items" => [{ "metadata" => { "namespace" => "default", "name" => "w-1" } }],
+          "metadata" => { "resourceVersion" => "2" } }
+      end
+
+      reconciler = SyncGateSpecReconciler.new
+      reconciler.watched_informer = informer_widget
+      manager.add(reconciler, for: crontask_gvk)
+      manager.add(reconciler, for: widget_gvk)
+
+      runner = Thread.new { manager.start }
+      deadline = Time.now + 5
+      sleep 0.05 until widget_list_started[:value] || Time.now >= deadline
+      expect(widget_list_started[:value]).to be(true)
+
+      # While the widget informer is still listing its initial state, no
+      # reconcile may run, even though the cron-task informer already synced.
+      sleep 0.4
+      expect(reconciler.reconciled).to be_empty
+
+      gate << :go
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.reconciled.size >= 2 || Time.now >= deadline
+
+      # After the sync completes, the initial objects are processed and every
+      # reconcile observed a fully synced cache.
+      expect(reconciler.reconciled.map(&:first)).to contain_exactly("default/cron-1", "default/w-1")
+      expect(reconciler.reconciled.map(&:last)).to all(be(true))
+      expect(informer_crontask.synced).to be(true)
+      expect(informer_widget.synced).to be(true)
+    ensure
+      manager&.stop
+    end
+
+    it "does not start workers when a stop is requested during the sync wait" do
+      manager = described_class.new(leader_elect: false)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+      expect(manager.cache).to receive(:wait_for_sync) do
+        deadline = Time.now + 5
+        sleep 0.02 while !manager.instance_variable_get(:@stopped) && Time.now < deadline
+        false
+      end
+
+      done = ::Queue.new
+      Thread.new { manager.start; done << :done }
+      sleep 0.2 # let the startup thread reach the sync wait
+      manager.stop
+      Timeout.timeout(3) { done.pop }
+
+      expect(controller).not_to have_received(:start)
+      expect(controller).to have_received(:stop).at_least(:once)
+    end
+
+    it "registers and starts nothing when the manager is already stopped" do
+      manager = described_class.new(leader_elect: false)
+      allow(manager.cache).to receive(:start)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+      manager.instance_variable_set(:@stopped, true)
+
+      expect { manager.start }.not_to raise_error
+
+      expect(controller).not_to have_received(:register)
+      expect(manager.cache).not_to have_received(:start)
     end
   end
 end

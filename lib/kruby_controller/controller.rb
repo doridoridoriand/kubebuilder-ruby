@@ -62,13 +62,38 @@ module KrubyController
       end
     end
 
-    def stop
+    # Stops the controller. With +timeout+, waits at most `timeout` seconds
+    # in total for the workers to finish their in-flight reconcile; a worker
+    # that does not return within the remaining budget is abandoned (it
+    # exits on its next loop check; the closed queue delivers no further
+    # work). Without +timeout+ the join is unbounded (previous behavior).
+    def stop(timeout: nil)
       @running = false
       @queue.shutdown(@max_concurrent)
-      @workers&.each(&:join)
+      deadline = timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      (@workers || []).each do |worker|
+        remaining = deadline && deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if remaining && remaining <= 0
+          KrubyController.logger.warn(
+            "Controller #{@name}: stop budget exhausted; abandoning a running worker"
+          )
+          next
+        end
+
+        join_worker(worker, remaining)
+      end
     end
 
     private
+
+    def join_worker(worker, timeout)
+      return worker.join if timeout.nil?
+      return if worker.join(timeout)
+
+      KrubyController.logger.warn(
+        "Controller #{@name}: a reconcile did not return within #{timeout.round(1)}s; abandoning the worker"
+      )
+    end
 
     def worker_loop
       while @running

@@ -42,6 +42,26 @@ class SyncGateSpecReconciler < KrubyController::Reconciler
   end
 end
 
+# Records the first reconcile entry and then blocks, so the manager specs
+# can prove stop returns within its drain budget while a reconcile is
+# unresponsive.
+class BlockingSyncSpecReconciler < KrubyController::Reconciler
+  def initialize
+    @mutex = Mutex.new
+    @entered = false
+  end
+
+  def reconcile(_request)
+    @mutex.synchronize { @entered = true }
+    sleep 3
+    KrubyController::Result.ok
+  end
+
+  def entered?
+    @mutex.synchronize { @entered }
+  end
+end
+
 RSpec.describe KrubyController::Manager do
   let(:manager) { described_class.new }
   let(:controllers) { manager.instance_variable_get(:@controllers) }
@@ -391,6 +411,85 @@ RSpec.describe KrubyController::Manager do
       expect(informer.synced).to be(true)
     ensure
       manager&.stop
+    end
+  end
+
+  describe "graceful start and stop (#53)" do
+    let(:crontask_gvk) do
+      KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask", resource: "crontasks")
+    end
+
+    it "blocks in start until stop is requested (no leader election)" do
+      manager = described_class.new(leader_elect: false)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+
+      runner = Thread.new { manager.start }
+      sleep 0.3 # startup completes immediately with no informers; start must keep blocking
+      expect(runner.alive?).to be(true)
+
+      manager.stop
+      Timeout.timeout(2) { runner.join }
+
+      expect(controller).to have_received(:stop).at_least(:once)
+    end
+
+    it "records a signal in the trap without acquiring Mutexes" do
+      previous = {}
+      %w[TERM INT].each { |sig| previous[sig] = Signal.trap(sig, "DEFAULT") }
+      manager = described_class.new(leader_elect: false)
+      manager.send(:setup_signal_handlers)
+
+      Process.kill("TERM", Process.pid)
+      sleep 0.2
+
+      expect(manager.instance_variable_get(:@stop_requested_by_signal)).to be(true)
+    ensure
+      %w[TERM INT].each { |sig| Signal.trap(sig, previous[sig] || "DEFAULT") }
+    end
+
+    it "returns from stop within the drain budget while a reconcile is unresponsive" do
+      manager = described_class.new(leader_elect: false, stop_timeout: 1)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
+
+      informer = manager.cache.register(gvk: crontask_gvk)
+      allow(informer).to receive(:fetch_list).and_return(
+        { "items" => [{ "metadata" => { "namespace" => "default", "name" => "cron-1" } }],
+          "metadata" => { "resourceVersion" => "1" } }
+      )
+
+      reconciler = BlockingSyncSpecReconciler.new
+      manager.add(reconciler, for: crontask_gvk)
+
+      runner = Thread.new { manager.start }
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.entered? || Time.now >= deadline
+      expect(reconciler.entered?).to be(true)
+
+      t0 = Time.now
+      manager.stop
+      elapsed = Time.now - t0
+
+      # stop_timeout 1s is the whole reconcile-drain budget; the stop must
+      # return long before the 3s reconcile completes.
+      expect(elapsed).to be < 2.0
+      Timeout.timeout(2) { runner.join }
+    ensure
+      manager&.stop
+    end
+
+    it "is idempotent when stop is called repeatedly" do
+      manager = described_class.new(leader_elect: false)
+      controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
+      manager.instance_variable_get(:@controllers) << controller
+
+      manager.stop
+      expect { manager.stop }.not_to raise_error
+
+      expect(controller).to have_received(:stop).once
     end
   end
 end

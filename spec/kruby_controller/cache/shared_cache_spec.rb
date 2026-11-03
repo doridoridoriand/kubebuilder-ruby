@@ -143,8 +143,8 @@ RSpec.describe KrubyController::Cache::SharedCache do
       )
       # The watch stream is closed immediately; the informer falls back to its
       # reconnect loop. The List above is what populates and syncs the store.
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       allow(fake_watch).to receive(:connect) { raise StandardError, "watch stream closed" }
 
       informer = cache.register(gvk: gvk)

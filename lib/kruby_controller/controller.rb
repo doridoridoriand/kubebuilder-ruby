@@ -21,31 +21,39 @@ module KrubyController
       @reconciler.logger = KrubyController.logger
     end
 
-    def start
-      @running = true
+    # Reopens the queue from a previous lifecycle BEFORE the registration
+    # guard: on leadership reacquisition the handlers are already registered
+    # (this method is a no-op) and the restarted cache emits its initial List
+    # diff while workers are still down, so the queue must accept events
+    # again or the changes observed while leaderless are silently dropped.
+    def register
       @queue.reset if @queue.shutdown?
-      unless @handler_registered
-        informer = @cache.register(gvk: @for_gvk)
-        base = Handler::EnqueuedObject.new(queue: @queue)
-        informer.add_handler(@predicate ? Handler::Predicated.new(handler: base, predicate: @predicate) : base)
+      return if @handler_registered
 
-        @owns.each do |owner_gvk|
-          owns_informer = @cache.register(gvk: owner_gvk)
-          owns_informer.add_handler(
-            Handler::EnqueuedOwner.new(queue: @queue, owner_gvk: @for_gvk, owner_namespaced: @for_gvk.namespaced?)
-          )
-        end
+      informer = @cache.register(gvk: @for_gvk)
+      base = Handler::EnqueuedObject.new(queue: @queue)
+      informer.add_handler(@predicate ? Handler::Predicated.new(handler: base, predicate: @predicate) : base)
 
-        @watches.each do |watch|
-          watch_informer = @cache.register(gvk: watch[:gvk])
-          handler = watch[:handler] || Handler::EnqueuedObject.new(queue: @queue)
-          handler = Handler::Predicated.new(handler: handler, predicate: watch[:predicate]) if watch[:predicate]
-          watch_informer.add_handler(handler)
-        end
-
-        @handler_registered = true
+      @owns.each do |owner_gvk|
+        owns_informer = @cache.register(gvk: owner_gvk)
+        owns_informer.add_handler(
+          Handler::EnqueuedOwner.new(queue: @queue, owner_gvk: @for_gvk, owner_namespaced: @for_gvk.namespaced?)
+        )
       end
 
+      @watches.each do |watch|
+        watch_informer = @cache.register(gvk: watch[:gvk])
+        handler = watch[:handler] || Handler::EnqueuedObject.new(queue: @queue)
+        handler = Handler::Predicated.new(handler: handler, predicate: watch[:predicate]) if watch[:predicate]
+        watch_informer.add_handler(handler)
+      end
+
+      @handler_registered = true
+    end
+
+    def start
+      register
+      @running = true
       @workers = (1..@max_concurrent).map do |i|
         Thread.new do
           KrubyController.logger.info("Controller #{@name} worker #{i} started")

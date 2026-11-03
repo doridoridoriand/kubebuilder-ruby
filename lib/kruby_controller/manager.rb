@@ -144,12 +144,31 @@ module KrubyController
     end
 
     def start_and_sync
-      start_controllers
+      # A stop requested before startup began: register nothing, start nothing.
+      return if @stopped
+
+      register_controllers
       @cache.start
       # A cache that is not synced within the timeout is just as fatal as one
       # that fails outright: fail startup (stopping the components we just
       # started) instead of running controllers against an empty/stale cache.
-      raise KrubyController::Error, "Manager: cache did not sync within the timeout" unless @cache.wait_for_sync
+      synced = @cache.wait_for_sync
+      if @stopped || !leader?
+        # A stop raced in during the sync wait, or leadership was lost while
+        # the cache was syncing (the elector flags the loss before its
+        # on_stopped_leading cleanup runs). stop() may already have stopped
+        # the components; stop_components is idempotent. Workers must never
+        # start without the lease or on a stopped manager.
+        stop_components
+        return
+      end
+      raise KrubyController::Error, "Manager: cache did not sync within the timeout" unless synced
+
+      # Workers start only after every informer completed its initial List
+      # (FR-03). Events observed during the wait are held in the work queue
+      # and replayed once workers run, so no reconcile sees a partially
+      # synced cache and no initial event is lost.
+      start_controllers
     rescue StandardError => e
       # A cache that cannot sync is fatal: stop the components we just
       # started and let the error propagate (Manager#start fails with it).
@@ -165,6 +184,10 @@ module KrubyController
 
     def start_controllers
       @controllers.each(&:start)
+    end
+
+    def register_controllers
+      @controllers.each(&:register)
     end
 
     def setup_signal_handlers

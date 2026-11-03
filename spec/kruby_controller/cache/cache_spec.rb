@@ -76,6 +76,26 @@ RSpec.describe KrubyController::Cache::SharedCache do
       expect(cache.list(gvk).first.dig("status", "notes")).to eq("original")
     end
 
+    it "copies only the namespace-matching objects (the filter runs before the copy)" do
+      other = { "metadata" => { "namespace" => "kube-system", "name" => "rich", "resourceVersion" => "2" } }
+      cache.register(gvk: gvk).store.add(KrubyController::Cache::Delta::ADDED, other)
+
+      copied = []
+      allow(KrubyController::Cache).to receive(:deep_copy).and_wrap_original do |method, obj|
+        # module_function recursion also routes through the receiver, so
+        # record only the top-level resource objects
+        copied << obj if obj.is_a?(Hash) && obj.key?("metadata")
+        method.call(obj)
+      end
+
+      results = cache.list(gvk, namespace: "default")
+
+      expect(results.size).to eq(1)
+      expect(results.first.dig("metadata", "namespace")).to eq("default")
+      # the other namespace's object was never deep-copied for this read
+      expect(copied.map { |o| o.dig("metadata", "namespace") }).to eq(["default"])
+    end
+
     it "copy: false returns the store-owned object" do
       raw = cache.get(gvk, "default", "rich", copy: false)
       expect(raw).to equal(cache.get(gvk, "default", "rich", copy: false))

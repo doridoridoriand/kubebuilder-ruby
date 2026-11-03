@@ -17,6 +17,7 @@ module KrubyController
       @rate_limiter = rate_limiter || Queue::ExponentialBackoffRateLimiter.new
       @queue = Queue::WorkQueue.new(rate_limiter: @rate_limiter)
       @running = false
+      @generation = 0
       @reconciler.cache = cache
       @reconciler.logger = KrubyController.logger
     end
@@ -54,24 +55,62 @@ module KrubyController
     def start
       register
       @running = true
+      # A generation token isolates workers across lifecycles: a worker
+      # abandoned by a timed-out stop (still inside a reconcile when stop
+      # gave up) must not resume pulling from the queue that a later start
+      # reopened for the NEW generation.
+      @generation += 1
+      generation = @generation
       @workers = (1..@max_concurrent).map do |i|
         Thread.new do
           KrubyController.logger.info("Controller #{@name} worker #{i} started")
-          worker_loop
+          worker_loop(generation)
         end
       end
     end
 
-    def stop
+    # Stops the controller. With +timeout+, waits at most `timeout` seconds
+    # in total for the workers to finish their in-flight reconcile; a worker
+    # that does not return within the remaining budget is abandoned AND
+    # removed from #workers so a later stop does not wait for it again (it
+    # exits on its next loop check, or on the generation check if the
+    # controller was restarted first). Without +timeout+ the join is
+    # unbounded (previous behavior).
+    def stop(timeout: nil)
       @running = false
       @queue.shutdown(@max_concurrent)
-      @workers&.each(&:join)
+      deadline = timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      abandoned = []
+      (@workers || []).each do |worker|
+        remaining = deadline && deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        if remaining && remaining <= 0
+          KrubyController.logger.warn(
+            "Controller #{@name}: stop budget exhausted; abandoning a running worker"
+          )
+          abandoned << worker
+          next
+        end
+
+        abandoned << worker unless join_worker(worker, remaining)
+      end
+      @workers -= abandoned unless abandoned.empty?
     end
 
     private
 
-    def worker_loop
-      while @running
+    # Returns true when the worker exited within the timeout.
+    def join_worker(worker, timeout)
+      return worker.join if timeout.nil?
+      return true if worker.join(timeout)
+
+      KrubyController.logger.warn(
+        "Controller #{@name}: a reconcile did not return within #{timeout.round(1)}s; abandoning the worker"
+      )
+      false
+    end
+
+    def worker_loop(generation)
+      while @running && @generation == generation
         request = @queue.get
         break if request.equal?(Queue::WorkQueue::SENTINEL)
 

@@ -19,7 +19,17 @@ RSpec.describe "Manager lifecycle (subprocess, #53)" do
       def body = '{"items":[],"metadata":{"resourceVersion":"1"}}'
     end
     class KrcFakeRequest
-      def initialize(path) = @path = path
+      def initialize(path)
+        @path = path
+        @options = {}
+      end
+
+      attr_reader :options
+
+      def on_headers = nil
+
+      def on_body = nil
+
       def run
         raise KrubyController::Error, "no watch in subprocess test" if @path.include?("watch=true")
         KrcFakeResponse.new

@@ -307,36 +307,45 @@ class KrubyController::Cache::Informer
     @watch_thread = Thread.new { watch_loop }
   end
 
-  # 初回リスト取得
+  # 初回リスト取得 (#45: continue トークンを追跡し全ページ収集してから
+  # 1 スナップショットとして atomic に反映。途中失敗は部分反映しない)
   def populate
-    list_path = rest_path_for(@gvk, action: :list)
-    resp = @api_client.get(list_path)
-    items = parse_list(resp)
+    items, rv = fetch_all_pages   # 410 (continue 期限切れ) は先頭ページからやり直し
     items.each do |item|
       @store.add(Delta::ADDED, item)
     end
-    @resource_version = resp['metadata']['resourceVersion']
+    @resource_version = rv   # RV が無い応答はプロトコル違反として失敗させる
     @synced = true
   end
 
   # Watch ループ (切断再試行付き)
   def watch_loop
     loop while @running do
-      watch = Kubernetes::Watch.new(@api_client)
+      stream = WatchStream.new(@api_client)   # kruby の Watch ではなく自前ストリーム
       watch_path = rest_path_for(@gvk, action: :watch, rv: @resource_version)
 
-      watch.connect(watch_path) do |event|
-        type = event_type(event)  # ADDED / MODIFIED / DELETED
-        obj = event['object']
-        @resource_version = event['object']['metadata']['resourceVersion']
-        @store.add(type, obj)
-
-        # delta を event handlers に配送
-        @handlers.each { |h| h.handle(type, obj) }
+      stream.connect(watch_path) do |event|
+        case event['type']
+        when 'ADDED', 'MODIFIED', 'DELETED'
+          rv = event['object'].dig('metadata', 'resourceVersion')
+          @resource_version = rv unless rv.nil? || rv.empty?   # RV を nil で壊さない
+          @store.add(event_type(event), event['object'])
+          @handlers.each { |h| h.handle(event_type(event), event['object']) }
+        when 'BOOKMARK'
+          rv = event['object'].dig('metadata', 'resourceVersion')
+          @resource_version = rv unless rv.nil? || rv.empty?   # 有効な RV のみ更新
+        when 'ERROR'
+          raise WatchStream::Gone if event.dig('object', 'code') == 410   # 即 relist
+          raise WatchStream::Error.new(code: event.dig('object', 'code')) # バックオフ後に relist
+        else
+          logger.warn("unclassified watch event: #{event['type'].inspect}")  # RV を壊さず無視
+        end
       end
-    rescue => e
-      sleep backoff_interval
-      retry
+    rescue WatchStream::Gone
+      relist   # 410 は新規 LIST から再開 (バックオフなし)
+    rescue StandardError => e
+      sleep [backoff_interval, e.retry_after].compact.max   # Retry-After を尊重
+      relist
     end
   end
 
@@ -1583,6 +1592,8 @@ Main Thread
 **課題**: kruby の `Watch#connect` はブロック型。接続切断時の再試行ロジックを Informer 側で実装する必要がある。
 
 **対応**: Informer は watch ループを try/rescue + sleep/backoff でラップ。resourceVersion を保持し、直地点から再開。
+
+**#45 追記 (2026-11-03)**: kruby の `Watch` は 410 Gone を内部で自動再接続する (`current_resource_version = nil` で "now" から watch) — これは古い RV と再接続の間のイベントを**無音で欠損**させる。そのため Informer は kruby の Watch を使わず、自前の `WatchStream` (ApiClient 直構築・on_body ストリーミング・自動再接続なし・idle タイムアウト無効) で watch する。ERROR イベントも含めて全イベントを Informer に渡し、分類 (ADDED/MODIFIED/DELETED → store+handler、BOOKMARK → RV のみ、ERROR 410 → 即 relist、その他 ERROR → バックオフ後に relist) は Informer 側が行う。
 
 ### 9.3 CRD Generator の完全性
 

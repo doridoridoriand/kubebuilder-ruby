@@ -33,15 +33,19 @@ module KrubyController
         informer.store.get(namespace, name, copy:)
       end
 
-      # See #get for the copy contract. The +namespace+ filter runs before
-      # the copy, so a filtered +list+ only pays for the objects it returns.
+      # See #get for the copy contract. The +namespace+ filter runs BEFORE
+      # the copy, so a filtered +list+ only pays for the objects it returns:
+      # the store hands out an un-copied snapshot (store-owned objects are
+      # never mutated in place, so the snapshot stays a consistent view), the
+      # namespace selection runs on it outside the store lock, and only the
+      # selected objects are deep-copied — also outside the lock.
       def list(gvk, namespace: nil, label_selector: nil, copy: true)
         informer = @informers[gvk.to_s]
         return [] unless informer
 
-        results = informer.store.list(label_selector:, copy:)
+        results = informer.store.list(label_selector:, copy: false)
         results = results.select { |o| ns_matches?(o, namespace) } if namespace
-        results
+        copy ? results.map { |o| Cache.deep_copy(o) } : results
       end
 
       # Waits until every informer is synced. If an informer exhausts its

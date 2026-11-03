@@ -25,6 +25,74 @@ RSpec.describe KrubyController::Cache::Informer do
   let(:api_client) { instance_double(Kubernetes::ApiClient, build_request: request) }
   let(:informer) { described_class.new(gvk: gvk, store: store, api_client: api_client) }
 
+  describe "handler delivery ownership (#46)" do
+    let(:generation) { informer.instance_variable_get(:@generation) }
+    let(:recorder) { InformerSpecEventRecorder.new }
+    let(:event_obj) do
+      {
+        "metadata" => { "namespace" => "default", "name" => "a", "resourceVersion" => "5" },
+        "spec" => { "steps" => [{ "name" => "one" }] }
+      }
+    end
+    let(:mutating_handler) do
+      Class.new do
+        def handle(_type, obj)
+          obj["spec"]["steps"].clear
+          obj["metadata"]["resourceVersion"] = "999"
+        end
+      end.new
+    end
+
+    before { informer.instance_variable_set(:@running, true) }
+
+    it "delivers a deep copy: a mutating handler cannot corrupt the store" do
+      store.add(KrubyController::Cache::Delta::ADDED, event_obj)
+      informer.add_handler(mutating_handler)
+
+      informer.send(:notify, KrubyController::Cache::Delta::MODIFIED, event_obj, generation)
+
+      expect(store.get("default", "a").dig("spec", "steps").size).to eq(1)
+      expect(store.get("default", "a").dig("metadata", "resourceVersion")).to eq("5")
+    end
+
+    it "delivers a deep copy when the input is the store-owned object (relist path)" do
+      # emit_relist_events hands store-owned objects (the diff maps) to
+      # notify; the delivery copy is the only thing standing between a
+      # mutating handler and the live store there.
+      store.add(KrubyController::Cache::Delta::ADDED, event_obj)
+      owned = store.get("default", "a", copy: false)
+
+      informer.add_handler(mutating_handler)
+      informer.send(:notify, KrubyController::Cache::Delta::MODIFIED, owned, generation)
+
+      expect(store.get("default", "a").dig("spec", "steps").size).to eq(1)
+      expect(store.get("default", "a").dig("metadata", "resourceVersion")).to eq("5")
+    end
+
+    it "keeps the delivered copy independent of the input event object" do
+      informer.add_handler(recorder)
+      store.add(KrubyController::Cache::Delta::ADDED, event_obj)
+
+      informer.send(:notify, KrubyController::Cache::Delta::MODIFIED, event_obj, generation)
+      event_obj["spec"]["steps"].clear # the watch layer may reuse its buffer
+
+      expect(recorder.events.first[1].dig("spec", "steps").size).to eq(1)
+      expect(store.get("default", "a").dig("spec", "steps").size).to eq(1)
+    end
+
+    it "a mutating predicate cannot corrupt the store" do
+      predicate = ->(obj) { obj["spec"]["steps"].clear; true }
+      predicated = KrubyController::Handler::Predicated.new(handler: recorder, predicate: predicate)
+      informer.add_handler(predicated)
+      store.add(KrubyController::Cache::Delta::ADDED, event_obj)
+
+      informer.send(:notify, KrubyController::Cache::Delta::MODIFIED, event_obj, generation)
+
+      expect(store.get("default", "a").dig("spec", "steps").size).to eq(1)
+      expect(recorder.events.size).to eq(1)
+    end
+  end
+
   describe "#populate" do
     let(:generation) { informer.instance_variable_get(:@generation) }
 

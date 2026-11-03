@@ -21,18 +21,25 @@ module KrubyController
         end
       end
 
-      def get(gvk, namespace, name)
+      # Returns an independent deep copy of the cached object by default
+      # (issue #46): the reconciler may mutate the result — e.g. before an
+      # API update — without ever rewriting the cache. +copy: false+ hands
+      # back the store-owned object for hot paths that only read it and do
+      # not retain it; mutating that result corrupts the cache.
+      def get(gvk, namespace, name, copy: true)
         informer = @informers[gvk.to_s]
         return nil unless informer
 
-        informer.store.get(namespace, name)
+        informer.store.get(namespace, name, copy:)
       end
 
-      def list(gvk, namespace: nil, label_selector: nil)
+      # See #get for the copy contract. The +namespace+ filter runs before
+      # the copy, so a filtered +list+ only pays for the objects it returns.
+      def list(gvk, namespace: nil, label_selector: nil, copy: true)
         informer = @informers[gvk.to_s]
         return [] unless informer
 
-        results = informer.store.list(label_selector:)
+        results = informer.store.list(label_selector:, copy:)
         results = results.select { |o| ns_matches?(o, namespace) } if namespace
         results
       end

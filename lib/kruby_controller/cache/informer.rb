@@ -248,13 +248,21 @@ module KrubyController
         (old.keys - new.keys).each { |key| notify(Delta::DELETED, old[key], generation) }
       end
 
-      # Delivers an event to every registered handler. A handler that raises
-      # is logged and skipped so one bad handler cannot suppress the remaining
-      # handlers for this event, nor the events that follow it (critical during
-      # a relist, where the store snapshot is already committed).
+      # Delivers an event to every registered handler. The delivered object
+      # is an independent deep copy of the store-owned object (issue #46):
+      # a handler (or a reconciler, predicate, or anything the handler
+      # passes it to) may mutate the copy freely without ever corrupting the
+      # cache. All handlers of one event share the single copy, so a handler
+      # that mutates it is visible to the other handlers of the SAME event —
+      # treat the delivered object as read-only, like controller-runtime
+      # does. A handler that raises is logged and skipped so one bad handler
+      # cannot suppress the remaining handlers for this event, nor the
+      # events that follow it (critical during a relist, where the store
+      # snapshot is already committed).
       def notify(type, obj, generation)
+        delivered = Cache.deep_copy(obj)
         @handlers.each do |h|
-          with_active_run(generation) { h.handle(type, obj) }
+          with_active_run(generation) { h.handle(type, delivered) }
         rescue StandardError => e
           KrubyController.logger.error("Handler for #{@gvk} failed on #{type}: #{e.message}")
         end

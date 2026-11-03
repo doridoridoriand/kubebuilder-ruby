@@ -8,7 +8,7 @@
 |---|---|---|
 | Manager、複数 controller、leader election | 基本実装あり。競合、停止、フェイルオーバーや待機系 rollout の実環境検証は不足 | #17、#37、#51〜#53 |
 | List/Watch、cache | 基本実装あり。Watch の ERROR/BOOKMARK、ページ分割、429 と復旧、可変 Hash の分離が不足。現行コードだけで大規模・障害時の同等性は未実証 | #45、#46、#51、#52 |
-| Queue / reconcile | queue 重複排除・backoff は基本実装。遅延タスクごとにスレッドを作るため、大量障害時の資源上限が課題 | #47、#51 |
+| Queue / reconcile | queue 重複排除・backoff、遅延再試行は共有スケジューラ (キューあたりスレッド1本) で実装。実環境での大規模・障害時の同等性は未実証 | #51 |
 | Client、status、finalizer | cache 読みと書き込みが分離。競合時の安全な再計算、status/finalizer の同時変更は要検証 | #32、#46、#51 |
 | Watch / handler / predicate | owns・watches・predicate は基本実装。old/new・server selector・field index は計画段階。非所有 resource から主 resource への任意の複数 request 対応を #34 / #51 で検証 | #16、#33〜#35、#51 |
 | CRD schema、status / scale | 単一 version、基本型・required・default・enum は実装。詳細制約は #40、構造化 map/list・CEL・scale は #48 | #15、#40、#48 |

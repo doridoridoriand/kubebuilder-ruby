@@ -566,10 +566,9 @@ class KrubyController::Queue::WorkQueue
   end
 
   def add_after(request, seconds)
-    Thread.new do
-      sleep seconds
-      add(request)
-    end
+    # 遅延再試行は共有スケジューラ (キューあたりスレッド1本) が期限順に発火する。
+    # リクエストごとのスレッドは生成しない (障害時のスレッド数は O(1))。
+    scheduler.schedule(request, delay: seconds)
   end
 
   def get  # blocking

@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - WorkQueue: delayed-retry registration validates the closed state and retry lifecycle in the same critical section as the insertion (a shutdown can no longer leave a scheduler thread running on a closed queue or hang its own join); shutdown/reset retire the current scheduler via a per-scheduler stop flag; at most one pending delayed entry per key survives registration, so a superseded deadline never produces a second copy (#57)
 
 ### Changed
+- Cache: the store owns an independent deep copy of every object — ingest (add/replace) and outbound (`get`/`list`/handler delivery) both cross a copy boundary, so caller or handler mutations can never rewrite the cache before an API write; `copy: false` opts out per read for hot paths that only inspect the object (#46)
 - WorkQueue: delayed retries (`add_after` / `add_rate_limited`) run through a shared per-queue scheduler thread instead of one thread per retry; shutdown/reset free the thread and purge pending entries (#47)
 - Manager: reconcile workers start only after the cache is fully synced; handlers register first and initial events replay from the queue (FR-03) (#52)
 - Controller: `register` reopens a work queue closed by a previous lifecycle before resync, so the changes observed while leaderless are buffered on reacquisition (#52)

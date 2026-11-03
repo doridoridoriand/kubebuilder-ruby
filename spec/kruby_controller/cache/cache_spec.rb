@@ -35,4 +35,70 @@ RSpec.describe KrubyController::Cache::SharedCache do
       expect { cache.wait_for_sync(timeout: 1) }.to raise_error(KrubyController::Error, /403/)
     end
   end
+
+  describe "object ownership (deep copy, #46)" do
+    let(:gvk) do
+      KrubyController::GVK.new(group: "stable.example.com", version: "v1", kind: "CronTask", resource: "crontasks")
+    end
+    let(:cache) do
+      cache = described_class.new
+      # register builds an informer with an api_client; stub it so no real
+      # kubeconfig is needed (the copy contract never touches the network).
+      allow(cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      cache
+    end
+    let(:rich_obj) do
+      {
+        "metadata" => { "namespace" => "default", "name" => "rich", "labels" => { "app" => "cron" } },
+        "spec" => { "steps" => [{ "name" => "one" }] },
+        "status" => { "notes" => "original" }
+      }
+    end
+
+    before do
+      store = cache.register(gvk: gvk).store
+      store.add(KrubyController::Cache::Delta::ADDED, rich_obj)
+    end
+
+    it "get returns an independent copy: a reconciler mutation before an API update never rewrites the cache" do
+      obj = cache.get(gvk, "default", "rich")
+      obj["status"]["notes"] = "pre-update-mutation"
+      obj["spec"]["steps"].clear
+
+      expect(cache.get(gvk, "default", "rich").dig("status", "notes")).to eq("original")
+      expect(cache.get(gvk, "default", "rich").dig("spec", "steps").size).to eq(1)
+    end
+
+    it "list returns independent copies" do
+      objs = cache.list(gvk)
+      objs.each { |o| o["status"]["notes"] = "mutated" }
+
+      expect(cache.list(gvk).first.dig("status", "notes")).to eq("original")
+    end
+
+    it "copies only the namespace-matching objects (the filter runs before the copy)" do
+      other = { "metadata" => { "namespace" => "kube-system", "name" => "rich", "resourceVersion" => "2" } }
+      cache.register(gvk: gvk).store.add(KrubyController::Cache::Delta::ADDED, other)
+
+      copied = []
+      allow(KrubyController::Cache).to receive(:deep_copy).and_wrap_original do |method, obj|
+        # module_function recursion also routes through the receiver, so
+        # record only the top-level resource objects
+        copied << obj if obj.is_a?(Hash) && obj.key?("metadata")
+        method.call(obj)
+      end
+
+      results = cache.list(gvk, namespace: "default")
+
+      expect(results.size).to eq(1)
+      expect(results.first.dig("metadata", "namespace")).to eq("default")
+      # the other namespace's object was never deep-copied for this read
+      expect(copied.map { |o| o.dig("metadata", "namespace") }).to eq(["default"])
+    end
+
+    it "copy: false returns the store-owned object" do
+      raw = cache.get(gvk, "default", "rich", copy: false)
+      expect(raw).to equal(cache.get(gvk, "default", "rich", copy: false))
+    end
+  end
 end

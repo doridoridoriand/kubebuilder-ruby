@@ -146,6 +146,18 @@ RSpec.describe KrubyController::Manager do
     end
   end
 
+  describe "list_page_size option (#45)" do
+    it "threads list_page_size into every informer it registers" do
+      manager = described_class.new(list_page_size: 250)
+      gvk = KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget")
+
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      informer = manager.cache.register(gvk: gvk)
+
+      expect(informer.list_page_size).to eq(250)
+    end
+  end
+
   describe "startup failure (cache cannot sync)" do
     it "stops components and raises when the cache cannot sync (no leader election)" do
       manager = described_class.new(leader_elect: false)

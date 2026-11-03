@@ -91,6 +91,13 @@ module KrubyController
         source = response || headers_seen
         return if source.nil? || success_code?(source)
 
+        # Some API servers reject a stale watch resourceVersion with an HTTP
+        # 410 response instead of a streamed ERROR event; both forms must
+        # take the same recovery path (immediate relist, no backoff).
+        if source.code.to_i == 410
+          raise WatchStream::Gone.new("watch resourceVersion expired (410 Gone)", code: 410)
+        end
+
         raise WatchStream::Error.from_response("Watch request failed", source)
       end
 

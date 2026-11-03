@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Manager: `start` blocks until stop in both leader-election modes; SIGTERM/SIGINT are handled safely (trap handlers only set a flag) and `stop(timeout:)` bounds the reconcile drain evenly across controllers — including the leader-election stop path — returning even when a reconcile does not respond; the thread running `start` returns only after the drain completes (#53)
 - Controller: a worker abandoned by a timed-out stop is removed from the worker list and cannot resume on a later generation's reopened queue (per-generation token in the worker loop) (#53)
+- WorkQueue: delayed-retry registration validates the closed state and retry lifecycle in the same critical section as the insertion (a shutdown can no longer leave a scheduler thread running on a closed queue or hang its own join); shutdown/reset retire the current scheduler via a per-scheduler stop flag; at most one pending delayed entry per key survives registration, so a superseded deadline never produces a second copy (#57)
 
 ### Changed
 - WorkQueue: delayed retries (`add_after` / `add_rate_limited`) run through a shared per-queue scheduler thread instead of one thread per retry; shutdown/reset free the thread and purge pending entries (#47)

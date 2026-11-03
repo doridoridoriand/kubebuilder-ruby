@@ -111,7 +111,7 @@ module KrubyController
       # is abandoned (it exits on its next loop check; the closed queue
       # delivers no further work). Manager#stop returns per contract even
       # when a reconcile or watch does not respond.
-      budget = timeout.to_f / [@controllers.size, 1].max
+      budget = drain_budget
       @controllers.each { |c| c.stop(timeout: budget) }
       @cache.stop
       @stop_channel.send(:stopped)
@@ -198,8 +198,18 @@ module KrubyController
     end
 
     def stop_components
-      @controllers.each(&:stop)
+      # The leader-election stop path (on_stopped_leading inside the
+      # elector's thread) and the startup-failure rescue share this drain:
+      # it must use the same bounded budget as Manager#stop, or an
+      # unresponsive reconcile would block the elector join — and with it
+      # Manager#stop — beyond stop_timeout in the default mode.
+      budget = drain_budget
+      @controllers.each { |c| c.stop(timeout: budget) }
       @cache.stop
+    end
+
+    def drain_budget
+      @stop_timeout.to_f / [@controllers.size, 1].max
     end
 
     def start_controllers
@@ -219,15 +229,17 @@ module KrubyController
       end
     end
 
-    # Blocks until the manager is stopped: either #stop ran (any thread),
-    # a signal was received (the trap only sets the flag; this thread calls
-    # #stop from normal context), or startup failed and signaled the
-    # channel. Polls at SIGNAL_POLL_INTERVAL, so a signal is honored within
-    # that interval.
+    # Blocks until the manager is stopped AND the stop's own cleanup has
+    # completed: #stop sets @stopped before draining, so observing only the
+    # flag would let this thread return while another thread is still
+    # draining (a main-thread start returning early can kill the drainer).
+    # Either #stop's channel send (or the startup-failure signal) ends the
+    # wait; a signal received here performs #stop first, which sends on the
+    # channel when its drain finishes.
     def wait_for_stop
       loop do
         stop if @stop_requested_by_signal
-        return if @stopped
+        return @stop_channel.receive if @stopped
         return if @stop_channel.received?
 
         sleep SIGNAL_POLL_INTERVAL

@@ -231,4 +231,220 @@ RSpec.describe KrubyController::Queue::WorkQueue do
       expect(queue.len).to eq(0)
     end
   end
+
+  describe "shared scheduler (#47)" do
+    def req(name)
+      KrubyController::Request.new(namespace: "default", name: name)
+    end
+
+    def wait_for_len(work_queue, count, timeout: 5)
+      deadline = Time.now + timeout
+      sleep 0.02 while work_queue.len < count && Time.now < deadline
+      work_queue.len
+    end
+
+    it "processes mass delayed retries with a bounded number of threads" do
+      q = described_class.new
+      baseline = Thread.list.size
+      200.times { |i| q.add_after(req("m-#{i}"), 0.3) }
+
+      # While all 200 deadlines are pending, only the shared scheduler thread
+      # may exist: the per-request implementation would have ~200 sleeping
+      # threads alive here.
+      sleep 0.1
+      expect(Thread.list.size - baseline).to be <= 3
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "fires delayed retries in deadline order" do
+      q = described_class.new
+      q.add_after(req("c"), 0.15)
+      q.add_after(req("a"), 0.02)
+      q.add_after(req("b"), 0.08)
+
+      expect(wait_for_len(q, 3)).to eq(3)
+
+      popped = 3.times.map { q.get.namespaced_name.to_s }
+      expect(popped).to eq(%w[default/a default/b default/c])
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "dedupes a delayed fire against an immediate add for the same key" do
+      q = described_class.new
+      q.add_after(req_a, 0.05)
+      q.add(req_a) # immediate add wins: the key is pending right away
+
+      expect(q.len).to eq(1)
+
+      in_flight = q.get
+      sleep 0.15 # the delayed fire happens while the key is in flight
+      q.done(in_flight)
+
+      expect(q.len).to eq(1) # the fire was deduped (dirty), not a second copy
+      expect(q.get).to eq(req_a)
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "collapses two delayed retries of the same key into one enqueue" do
+      q = described_class.new
+      expect(q.add_after(req_a, 0.02)).to be(true)
+      expect(q.add_after(req_a, 0.08)).to be(false) # superseded: the earliest deadline wins
+
+      expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
+      first = q.get
+      sleep 0.15 # well past the superseded 0.08 deadline: no second fire
+      q.done(first)
+
+      expect(q.len).to eq(0) # exactly one enqueue, no second copy
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "never enqueues a second copy when the earlier retry completes before the later deadline" do
+      q = described_class.new
+      q.add_after(req_a, 0.02)
+      q.add_after(req_a, 0.20) # far later: superseded at registration
+
+      expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
+      first = q.get
+      q.done(first) # the earlier attempt completes long before 0.20
+      sleep 0.3
+
+      expect(q.len).to eq(0) # the superseded registration never fires
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "keeps the pending entry with the earliest deadline when replacing a later one" do
+      q = described_class.new
+      q.add_after(req_a, 0.10)
+      q.add_after(req_a, 0.02) # earlier: replaces the 0.10 entry
+
+      delayed = q.instance_variable_get(:@delayed)
+      expect(delayed.size).to eq(1)
+      # fire it and confirm only one enqueue happens
+      expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
+      expect(q.get).to eq(req_a)
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "records the dirty flag (not a duplicate) when a delayed fire hits an in-flight key" do
+      q = described_class.new
+      q.add(req_a)
+      in_flight = q.get
+      q.add_after(req_a, 0.02)
+
+      sleep 0.1 # the fire happens while the key is in flight
+
+      expect(q.len).to eq(0)
+      q.done(in_flight)
+      expect(q.len).to eq(1) # dirty -> re-queued exactly once
+      expect(q.get).to eq(req_a)
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "invalidates pre-shutdown entries and restarts the scheduler after reset" do
+      q = described_class.new
+      q.add_after(req_a, 0.05)
+      q.shutdown(1)
+      q.reset
+
+      sleep 0.2
+      expect(q.len).to eq(0) # the pre-shutdown entry never enqueues
+
+      q.add_after(req_b, 0.05) # a fresh scheduler is started lazily
+      expect(wait_for_len(q, 1)).to eq(1)
+      expect(q.get).to eq(req_b)
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "frees the shared scheduler thread on shutdown" do
+      q = described_class.new
+      q.add_after(req_a, 0.3)
+      thread = q.instance_variable_get(:@scheduler)&.thread
+      expect(thread).not_to be_nil
+
+      q.shutdown(1)
+      deadline = Time.now + 2
+      sleep 0.02 while thread.alive? && Time.now < deadline
+
+      expect(thread.alive?).to be(false)
+      # Only the shutdown sentinel remains: the purged entry did not enqueue.
+      expect(q.get).to equal(KrubyController::Queue::WorkQueue::SENTINEL)
+      expect(q.len).to eq(0)
+    end
+
+    it "converges a mass-retry burst and frees the scheduler on stop" do
+      q = described_class.new
+      300.times { |i| q.add_after(req("b-#{i}"), 0.02) }
+
+      expect(wait_for_len(q, 300)).to eq(300)
+
+      thread = q.instance_variable_get(:@scheduler)&.thread
+      expect(thread).not_to be_nil
+
+      q.shutdown(1)
+      deadline = Time.now + 2
+      sleep 0.02 while thread.alive? && Time.now < deadline
+      expect(thread.alive?).to be(false)
+    end
+
+    it "survives concurrent add_after calls without duplication" do
+      q = described_class.new
+      50.times.map do |i|
+        Thread.new { q.add_after(req("p-#{i}"), 0.03) }
+      end.each(&:join)
+
+      expect(wait_for_len(q, 50)).to eq(50)
+
+      q.shutdown(1)
+    end
+
+    it "never leaves a live scheduler on a closed queue when scheduling races shutdown" do
+      40.times do
+        q = described_class.new
+        racers = 6.times.map do
+          Thread.new do
+            10.times { |i| q.add_after(req("r-#{i}"), 0.001 + (rand * 0.01)) }
+          end
+        end
+        closer = Thread.new do
+          sleep 0.002
+          q.shutdown(1)
+        end
+
+        closer.join
+        racers.each(&:join)
+
+        handle = q.instance_variable_get(:@scheduler)
+        expect(handle.nil? || !handle.thread.alive?).to be(true)
+      end
+    end
+
+    it "retires and rejoins the scheduler when reset reopens a live queue" do
+      q = described_class.new
+      q.add_after(req_a, 0.3)
+      thread = q.instance_variable_get(:@scheduler)&.thread
+      expect(thread).not_to be_nil
+
+      q.reset # reset on a LIVE queue (no prior shutdown)
+
+      deadline = Time.now + 2
+      sleep 0.02 while thread.alive? && Time.now < deadline
+      expect(thread.alive?).to be(false)
+      expect(q.len).to eq(0) # the purged entry never fired
+
+      q.add_after(req_b, 0.05)
+      expect(wait_for_len(q, 1)).to eq(1)
+      expect(q.get).to eq(req_b)
+    ensure
+      q&.shutdown(1)
+    end
+  end
 end

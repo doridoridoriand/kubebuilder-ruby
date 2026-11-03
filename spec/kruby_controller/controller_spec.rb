@@ -79,6 +79,77 @@ class BuilderSpecBlockingReconciler < KrubyController::Reconciler
   end
 end
 
+# Blocks the first reconcile until released and records the peak number of
+# concurrently running reconciles, so the abandoned-worker isolation spec
+# can assert that the max_concurrent invariant survives a timed-out stop.
+class BuilderSpecConcurrencyReconciler < KrubyController::Reconciler
+  attr_reader :max_in_flight
+
+  def initialize
+    @mutex = Mutex.new
+    @in_flight = 0
+    @max_in_flight = 0
+    @recorded_names = []
+    @first_started = false
+    @release_first = false
+    @condition = ConditionVariable.new
+  end
+
+  def reconcile(request)
+    name = request.namespaced_name.to_s
+    counted = false
+    first = @mutex.synchronize do
+      @recorded_names << name
+      @first_started = true
+      @condition.broadcast
+      first_call = @recorded_names.size == 1
+      unless first_call
+        # The parked first reconcile is excluded from the concurrency
+        # metric: it is in-flight but blocked on the gate, and the isolation
+        # question is whether the abandoned worker pulls NEW work while the
+        # current generation's worker is already running one.
+        @in_flight += 1
+        @max_in_flight = [@max_in_flight, @in_flight].max
+        counted = true
+      end
+      first_call
+    end
+
+    if first
+      @mutex.synchronize { @condition.wait(@mutex) until @release_first }
+    else
+      sleep 0.05
+    end
+    @mutex.synchronize { @in_flight -= 1 if counted }
+    KrubyController::Result.ok
+  end
+
+  def release_first_reconcile
+    @mutex.synchronize do
+      @release_first = true
+      @condition.broadcast
+    end
+  end
+
+  def wait_until_started(timeout: 2)
+    deadline = Time.now + timeout
+    sleep 0.02 until started? || Time.now >= deadline
+    started?
+  end
+
+  def started?
+    @mutex.synchronize { @first_started }
+  end
+
+  def include_names?(names)
+    @mutex.synchronize { (names - @recorded_names).empty? }
+  end
+
+  def recorded_names
+    @mutex.synchronize { @recorded_names.dup }
+  end
+end
+
 RSpec.describe KrubyController::Controller do
   let(:cache) { KrubyController::Cache::SharedCache.new }
   let(:reconciler) { BuilderSpecReconciler.new }
@@ -148,6 +219,50 @@ RSpec.describe KrubyController::Controller do
       controller.register
 
       expect(handlers_for(BuilderSpecCronTaskGVK).size).to eq(1)
+    end
+  end
+
+  describe "abandoned worker isolation (timed-out stop)" do
+    it "does not let an abandoned worker process a newer generation's queue" do
+      recorder = BuilderSpecConcurrencyReconciler.new
+      controller = described_class.new(
+        reconciler: recorder, cache: cache, for_gvk: BuilderSpecCronTaskGVK, max_concurrent: 1
+      )
+
+      controller.start
+      handlers_for(BuilderSpecCronTaskGVK).each do |h|
+        h.handle(KrubyController::Cache::Delta::ADDED,
+                 { "metadata" => { "namespace" => "default", "name" => "cron-1" } })
+      end
+      expect(recorder.wait_until_started).to be(true)
+
+      # The timed-out stop abandons the worker inside its reconcile.
+      controller.stop(timeout: 0.01)
+
+      # A restart reopens the queue for a new generation; the events land in
+      # it while the abandoned reconcile is still parked.
+      controller.start
+      handlers_for(BuilderSpecCronTaskGVK).each do |h|
+        h.handle(KrubyController::Cache::Delta::ADDED,
+                 { "metadata" => { "namespace" => "default", "name" => "cron-2" } })
+        h.handle(KrubyController::Cache::Delta::ADDED,
+                 { "metadata" => { "namespace" => "default", "name" => "cron-3" } })
+      end
+      sleep 0.01 # the new worker settles inside cron-2's reconcile (50ms)
+
+      recorder.release_first_reconcile
+
+      deadline = Time.now + 5
+      sleep 0.02 until recorder.include_names?(["default/cron-2", "default/cron-3"]) || Time.now >= deadline
+      expect(recorder.include_names?(["default/cron-2", "default/cron-3"])).to be(true)
+
+      # max_concurrent: 1 must hold even across an abandoned worker.
+      expect(recorder.max_in_flight).to eq(1)
+      expect(recorder.recorded_names).to contain_exactly(
+        "default/cron-1", "default/cron-2", "default/cron-3"
+      )
+    ensure
+      controller&.stop
     end
   end
 

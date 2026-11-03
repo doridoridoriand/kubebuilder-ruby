@@ -290,15 +290,43 @@ RSpec.describe KrubyController::Queue::WorkQueue do
 
     it "collapses two delayed retries of the same key into one enqueue" do
       q = described_class.new
-      q.add_after(req_a, 0.02)
-      q.add_after(req_a, 0.08)
+      expect(q.add_after(req_a, 0.02)).to be(true)
+      expect(q.add_after(req_a, 0.08)).to be(false) # superseded: the earliest deadline wins
 
       expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
-      in_flight = q.get
-      sleep 0.15 # the second deadline fires while the key is in flight
-      q.done(in_flight)
+      first = q.get
+      sleep 0.15 # well past the superseded 0.08 deadline: no second fire
+      q.done(first)
 
-      expect(q.len).to eq(1)
+      expect(q.len).to eq(0) # exactly one enqueue, no second copy
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "never enqueues a second copy when the earlier retry completes before the later deadline" do
+      q = described_class.new
+      q.add_after(req_a, 0.02)
+      q.add_after(req_a, 0.20) # far later: superseded at registration
+
+      expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
+      first = q.get
+      q.done(first) # the earlier attempt completes long before 0.20
+      sleep 0.3
+
+      expect(q.len).to eq(0) # the superseded registration never fires
+    ensure
+      q&.shutdown(1)
+    end
+
+    it "keeps the pending entry with the earliest deadline when replacing a later one" do
+      q = described_class.new
+      q.add_after(req_a, 0.10)
+      q.add_after(req_a, 0.02) # earlier: replaces the 0.10 entry
+
+      delayed = q.instance_variable_get(:@delayed)
+      expect(delayed.size).to eq(1)
+      # fire it and confirm only one enqueue happens
+      expect(wait_for_len(q, 1, timeout: 2)).to eq(1)
       expect(q.get).to eq(req_a)
     ensure
       q&.shutdown(1)
@@ -339,7 +367,7 @@ RSpec.describe KrubyController::Queue::WorkQueue do
     it "frees the shared scheduler thread on shutdown" do
       q = described_class.new
       q.add_after(req_a, 0.3)
-      thread = q.instance_variable_get(:@scheduler_thread)
+      thread = q.instance_variable_get(:@scheduler)&.thread
       expect(thread).not_to be_nil
 
       q.shutdown(1)
@@ -358,8 +386,10 @@ RSpec.describe KrubyController::Queue::WorkQueue do
 
       expect(wait_for_len(q, 300)).to eq(300)
 
+      thread = q.instance_variable_get(:@scheduler)&.thread
+      expect(thread).not_to be_nil
+
       q.shutdown(1)
-      thread = q.instance_variable_get(:@scheduler_thread)
       deadline = Time.now + 2
       sleep 0.02 while thread.alive? && Time.now < deadline
       expect(thread.alive?).to be(false)
@@ -374,6 +404,47 @@ RSpec.describe KrubyController::Queue::WorkQueue do
       expect(wait_for_len(q, 50)).to eq(50)
 
       q.shutdown(1)
+    end
+
+    it "never leaves a live scheduler on a closed queue when scheduling races shutdown" do
+      40.times do
+        q = described_class.new
+        racers = 6.times.map do
+          Thread.new do
+            10.times { |i| q.add_after(req("r-#{i}"), 0.001 + (rand * 0.01)) }
+          end
+        end
+        closer = Thread.new do
+          sleep 0.002
+          q.shutdown(1)
+        end
+
+        closer.join
+        racers.each(&:join)
+
+        handle = q.instance_variable_get(:@scheduler)
+        expect(handle.nil? || !handle.thread.alive?).to be(true)
+      end
+    end
+
+    it "retires and rejoins the scheduler when reset reopens a live queue" do
+      q = described_class.new
+      q.add_after(req_a, 0.3)
+      thread = q.instance_variable_get(:@scheduler)&.thread
+      expect(thread).not_to be_nil
+
+      q.reset # reset on a LIVE queue (no prior shutdown)
+
+      deadline = Time.now + 2
+      sleep 0.02 while thread.alive? && Time.now < deadline
+      expect(thread.alive?).to be(false)
+      expect(q.len).to eq(0) # the purged entry never fired
+
+      q.add_after(req_b, 0.05)
+      expect(wait_for_len(q, 1)).to eq(1)
+      expect(q.get).to eq(req_b)
+    ensure
+      q&.shutdown(1)
     end
   end
 end

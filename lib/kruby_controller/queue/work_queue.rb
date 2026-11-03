@@ -23,8 +23,35 @@ module KrubyController
     # requeued copy is a fresh `Request` object, so a delayed or duplicate
     # `done` for an older copy can never clear the in-flight entry of the
     # newer copy (per-dequeue identity, equivalent to a generation token).
+    #
+    # Delayed retries (from `add_after` / `add_rate_limited`) are managed by
+    # ONE shared scheduler thread per queue instead of one sleeping thread
+    # per retry (which scaled linearly with the failure volume). Ordering
+    # and priority rules:
+    #
+    # * Entries fire strictly in deadline order (equal deadlines in
+    #   scheduling order). A later deadline for a key that an earlier fire
+    #   already enqueued is a dedupe no-op, never a second copy.
+    # * An immediate `add` for a key with a pending delayed entry wins: the
+    #   key becomes pending/in flight right away and the delayed fire is
+    #   deduped when it fires. A delayed entry never preempts in-flight work.
+    # * A delayed fire while its key is in flight records the dirty flag
+    #   (exactly like an informer event), so the completion re-queues the
+    #   key once.
+    #
+    # shutdown purges pending entries and stops the scheduler thread;
+    # reset bumps `@retry_seq`, purges stale entries and lets the next
+    # delayed retry lazily start a fresh scheduler. Each entry validates
+    # against the retry lifecycle that scheduled it, so a delayed retry from
+    # a previous lifecycle is discarded instead of injecting stale work
+    # after Controller#start reopens the queue.
     class WorkQueue
       SENTINEL = Object.new.freeze
+
+      # A delayed enqueue promise. Fires at +due_at+ (monotonic clock) and
+      # enqueues only if the queue is still open and the retry lifecycle
+      # (seq) that scheduled it is still current.
+      DelayEntry = Struct.new(:due_at, :seq, :request)
 
       def initialize(rate_limiter: nil)
         @rate_limiter = rate_limiter
@@ -39,9 +66,15 @@ module KrubyController
         @cond = ConditionVariable.new
         @closed = false
         # Lifecycle counter for delayed retries. Bumped on every #reset so a
-        # retry scheduled in a previous lifecycle is discarded when it wakes
+        # retry scheduled in a previous lifecycle is discarded when it fires
         # (Controller#start reopens the same queue via #reset).
         @retry_seq = 0
+        # Deadline-sorted pending delayed entries; the shared scheduler
+        # thread fires them oldest-deadline-first.
+        @delayed = []
+        @scheduler_running = false
+        @scheduler_thread = nil
+        @scheduler_cond = ConditionVariable.new
       end
 
       def add(request)
@@ -53,20 +86,19 @@ module KrubyController
       end
 
       # Schedules +request+ to be enqueued after +seconds+. The retry is owned
-      # by the queue: it is rejected while the queue is closed and is
-      # invalidated (discarded, not enqueued) if the queue is shut down or
-      # reset before the timer fires, so a retry from a previous lifecycle can
-      # never inject stale work after Controller#start reopens the queue.
-      # Returns false when the queue is already closed and no timer was
-      # started; true otherwise.
+      # by the shared scheduler: it is rejected while the queue is closed and
+      # is discarded (not enqueued) if the queue is shut down or reset before
+      # the deadline fires, so a retry from a previous lifecycle can never
+      # inject stale work after Controller#start reopens the queue.
+      # Returns false when the queue is already closed and nothing was
+      # scheduled; true otherwise.
       def add_after(request, seconds)
-        gen = @mutex.synchronize { @closed ? :closed : @retry_seq }
-        return false if gen == :closed
+        seq = @mutex.synchronize do
+          return false if @closed
 
-        Thread.new do
-          sleep seconds
-          enqueue_when_valid(request, gen)
+          @retry_seq
         end
+        schedule(DelayEntry.new(monotonic_time + seconds, seq, request))
         true
       end
 
@@ -77,14 +109,12 @@ module KrubyController
       def add_rate_limited(request)
         raise ArgumentError, "WorkQueue#add_rate_limited requires a rate_limiter" unless @rate_limiter
 
-        return false if @mutex.synchronize { @closed }
+        delay, seq = @mutex.synchronize do
+          return false if @closed
 
-        delay = @rate_limiter.backoff(request.namespaced_name.to_s)
-        gen = @mutex.synchronize { @retry_seq }
-        Thread.new do
-          sleep delay
-          enqueue_when_valid(request, gen)
+          [@rate_limiter.backoff(request.namespaced_name.to_s), @retry_seq]
         end
+        schedule(DelayEntry.new(monotonic_time + delay, seq, request))
         true
       end
 
@@ -98,18 +128,6 @@ module KrubyController
           @queue << request
         end
         @cond.signal
-      end
-
-      # Invoked by a delayed-retry timer once it wakes. Enqueues only if the
-      # queue is still open and belongs to the same lifecycle the timer was
-      # created for (i.e. no shutdown/reset has invalidated it).
-      def enqueue_when_valid(request, gen)
-        @mutex.synchronize do
-          return if @closed
-          return unless gen == @retry_seq
-
-          do_add(request)
-        end
       end
 
       # Clears the rate limiter state for +request+'s key (controller-runtime's
@@ -174,10 +192,18 @@ module KrubyController
           return if @closed
 
           @closed = true
+          # No delayed retry survives a shutdown: purge the entries and stop
+          # the shared scheduler thread (joined below, outside the lock, so
+          # its resources are actually released).
+          @delayed.clear
+          @scheduler_running = false
+          @scheduler_cond.broadcast
           # Unblock any workers blocked in get
           num_workers.times { @queue << SENTINEL }
           @cond.broadcast
         end
+        thread = @mutex.synchronize { @scheduler_thread }
+        thread&.join
       end
 
       def shutdown?
@@ -202,9 +228,75 @@ module KrubyController
           @in_flight = {}
           @dirty = Set.new
           @closed = false
-          # Invalidate any delayed retries scheduled in the previous lifecycle.
+          # Invalidate any delayed retries scheduled in the previous lifecycle
+          # and drop their entries outright: every entry holds the previous
+          # seq, so purging is both correct and bounded.
           @retry_seq += 1
+          @delayed.clear
+          @scheduler_cond.broadcast
           @cond.broadcast
+        end
+      end
+
+      private
+
+      def monotonic_time
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
+      # Records a delayed entry and lazily starts the shared scheduler
+      # thread. Held entries are kept sorted by deadline so firing walks the
+      # array front-to-back in deadline order.
+      def schedule(entry)
+        @mutex.synchronize do
+          index = @delayed.bsearch_index { |e| e.due_at > entry.due_at } || @delayed.length
+          @delayed.insert(index, entry)
+          start_scheduler unless @scheduler_running
+          # Wake the scheduler early only if the new entry can become the
+          # earliest deadline; otherwise the current wait already governs.
+          @scheduler_cond.signal if @delayed.first.equal?(entry)
+        end
+      end
+
+      def start_scheduler
+        @scheduler_running = true
+        @scheduler_thread = Thread.new { scheduler_loop }
+      end
+
+      def scheduler_loop
+        loop do
+          stop = false
+          @mutex.synchronize do
+            if !@scheduler_running
+              stop = true
+            elsif @delayed.empty?
+              @scheduler_cond.wait(@mutex)
+            else
+              now = monotonic_time
+              earliest = @delayed.first
+              if earliest.due_at > now
+                @scheduler_cond.wait(@mutex, earliest.due_at - now)
+              else
+                fire_due_entries(now)
+              end
+            end
+          end
+          return if stop
+        end
+      end
+
+      # Fires every entry whose deadline has passed, in deadline order. A
+      # fire is discarded when its retry lifecycle is stale (a queue reset
+      # happened in between) or the queue is closed. Otherwise it goes
+      # through the same do_add path as an immediate add, so dedupe, the
+      # in-flight dirty flag and the rate limiter all see one consistent
+      # state.
+      def fire_due_entries(now)
+        until @delayed.empty? || @delayed.first.due_at > now
+          entry = @delayed.shift
+          next unless entry.seq == @retry_seq && !@closed
+
+          do_add(entry.request)
         end
       end
     end

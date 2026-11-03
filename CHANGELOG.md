@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Controller: a worker abandoned by a timed-out stop is removed from the worker list and cannot resume on a later generation's reopened queue (per-generation token in the worker loop) (#53)
 
 ### Changed
+- WorkQueue: delayed retries (`add_after` / `add_rate_limited`) run through a shared per-queue scheduler thread instead of one thread per retry; shutdown/reset free the thread and purge pending entries (#47)
 - Manager: reconcile workers start only after the cache is fully synced; handlers register first and initial events replay from the queue (FR-03) (#52)
 - Controller: `register` reopens a work queue closed by a previous lifecycle before resync, so the changes observed while leaderless are buffered on reacquisition (#52)
 

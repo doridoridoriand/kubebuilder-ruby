@@ -308,12 +308,12 @@ RSpec.describe KrubyController::Manager do
       expect(controller).to have_received(:stop).at_least(:once)
     end
 
-    it "registers and starts nothing when the manager is already stopped" do
+    it "registers and starts nothing when the manager was stopped before start" do
       manager = described_class.new(leader_elect: false)
       allow(manager.cache).to receive(:start)
       controller = instance_double(KrubyController::Controller, register: nil, start: nil, stop: nil)
       manager.instance_variable_get(:@controllers) << controller
-      manager.instance_variable_set(:@stopped, true)
+      manager.stop # a legitimate stop-before-start: drained nothing, signals the channel
 
       expect { manager.start }.not_to raise_error
 
@@ -477,6 +477,84 @@ RSpec.describe KrubyController::Manager do
       # return long before the 3s reconcile completes.
       expect(elapsed).to be < 2.0
       Timeout.timeout(2) { runner.join }
+    ensure
+      manager&.stop
+    end
+
+    it "bounds the drain on the leader-election stop path too" do
+      manager = described_class.new(leader_elect: true, stop_timeout: 1, retry_period: 0.01)
+      lease = Kubernetes::V1Lease.build_from_hash(metadata: {}, spec: { leaseDurationSeconds: 15 })
+      client = double("coordination client", read_namespaced_lease: lease, replace_namespaced_lease: lease)
+      allow(manager).to receive(:coordination_client).and_return(client)
+      allow(manager).to receive(:setup_signal_handlers)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
+
+      informer = manager.cache.register(gvk: crontask_gvk)
+      allow(informer).to receive(:fetch_list).and_return(
+        { "items" => [{ "metadata" => { "namespace" => "default", "name" => "cron-1" } }],
+          "metadata" => { "resourceVersion" => "1" } }
+      )
+
+      reconciler = BlockingSyncSpecReconciler.new
+      manager.add(reconciler, for: crontask_gvk)
+
+      runner = Thread.new { manager.start }
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.entered? || Time.now >= deadline
+      expect(reconciler.entered?).to be(true)
+
+      t0 = Time.now
+      manager.stop
+      elapsed = Time.now - t0
+
+      # stop() joins the elector thread, whose on_stopped_leading drains the
+      # controllers: that path must honor the same stop_timeout budget, or
+      # the 3s reconcile would block the stop beyond it.
+      expect(elapsed).to be < 2.0
+      Timeout.timeout(3) { runner.join }
+    ensure
+      manager&.stop
+    end
+
+    it "returns from start only after the stop cleanup completes" do
+      manager = described_class.new(leader_elect: false, stop_timeout: 1)
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      fake_watch = instance_double(Kubernetes::Watch)
+      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
+
+      informer = manager.cache.register(gvk: crontask_gvk)
+      allow(informer).to receive(:fetch_list).and_return(
+        { "items" => [{ "metadata" => { "namespace" => "default", "name" => "cron-1" } }],
+          "metadata" => { "resourceVersion" => "1" } }
+      )
+
+      reconciler = BlockingSyncSpecReconciler.new
+      manager.add(reconciler, for: crontask_gvk)
+
+      marks = {}
+      runner = Thread.new do
+        manager.start
+        marks[:start_returned] = Time.now
+      end
+      deadline = Time.now + 5
+      sleep 0.05 until reconciler.entered? || Time.now >= deadline
+      expect(reconciler.entered?).to be(true)
+
+      stopper = Thread.new do
+        marks[:stop_began] = Time.now
+        manager.stop
+      end
+      Timeout.timeout(5) { stopper.join }
+      Timeout.timeout(5) { runner.join }
+
+      # wait_for_stop must not return while stop() is still draining: the
+      # running thread returns only after the channel send inside stop(),
+      # which follows the bounded drain.
+      expect(marks[:start_returned] - marks[:stop_began]).to be > 0.8
     ensure
       manager&.stop
     end

@@ -4,6 +4,10 @@ module KrubyController
   class Manager
     attr_reader :cache, :stopped
 
+    # Interval at which the running thread polls for a stop request (the
+    # signal flag, a programmatic stop, or a startup failure).
+    SIGNAL_POLL_INTERVAL = 0.1
+
     def initialize(
       kube_config: nil,
       namespace: nil,
@@ -13,16 +17,19 @@ module KrubyController
       lease_duration: 15,
       renew_deadline: 10,
       retry_period: 2,
+      stop_timeout: 30,
       logger: nil
     )
       @kube_config = kube_config
       @namespace = namespace
       @leader_elect = leader_elect
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
+      @stop_timeout = stop_timeout
       @logger = logger
       @cache = Cache::SharedCache.new(kube_config:, namespace:)
       @controllers = []
       @stopped = false
+      @stop_requested_by_signal = false
       @stop_channel = Channel.new
       @startup_error = nil
       KrubyController.logger = @logger if @logger
@@ -55,6 +62,11 @@ module KrubyController
     def start
       KrubyController.logger.info("Starting manager...")
 
+      # Both modes block until stop is requested: SIGTERM/SIGINT set a flag
+      # (trap handlers must not acquire Mutexes) and the running thread
+      # performs the actual stop from normal context.
+      setup_signal_handlers
+
       if @leader_elect
         @leader_elector = Election::LeaderElector.new(
           client: coordination_client,
@@ -62,15 +74,15 @@ module KrubyController
           **@lease_opts
         )
         @leader_elector.run { start_leading }
-        setup_signal_handlers
-        @stop_channel.receive
-        # Safe from the main thread (a different thread than the elector's
+        wait_for_stop
+        # Safe from this thread (a different thread than the elector's
         # election_loop), so #stop's join cannot deadlock. Stopping first
         # releases the lease and halts renewal before we fail startup.
         @leader_elector&.stop
         raise @startup_error if @startup_error
       else
         start_and_sync
+        wait_for_stop
       end
     end
 
@@ -87,13 +99,21 @@ module KrubyController
       raise
     end
 
-    def stop(timeout: 30)
+    def stop(timeout: @stop_timeout)
       return if @stopped
 
       @stopped = true
       KrubyController.logger.info("Stopping manager...")
       @leader_elector&.stop
-      stop_components
+      # The drain budget is split evenly across controllers so the total
+      # reconcile wait stays bounded by `timeout`: each controller may use up
+      # to its share, and a worker still inside a reconcile after its share
+      # is abandoned (it exits on its next loop check; the closed queue
+      # delivers no further work). Manager#stop returns per contract even
+      # when a reconcile or watch does not respond.
+      budget = timeout.to_f / [@controllers.size, 1].max
+      @controllers.each { |c| c.stop(timeout: budget) }
+      @cache.stop
       @stop_channel.send(:stopped)
     end
 
@@ -192,7 +212,25 @@ module KrubyController
 
     def setup_signal_handlers
       %w[TERM INT].each do |sig|
-        Signal.trap(sig) { stop }
+        # A trap handler must not acquire Mutexes (raises ThreadError in trap
+        # context); only record the request. The running thread observes the
+        # flag in #wait_for_stop and performs the actual stop there.
+        Signal.trap(sig) { @stop_requested_by_signal = true }
+      end
+    end
+
+    # Blocks until the manager is stopped: either #stop ran (any thread),
+    # a signal was received (the trap only sets the flag; this thread calls
+    # #stop from normal context), or startup failed and signaled the
+    # channel. Polls at SIGNAL_POLL_INTERVAL, so a signal is honored within
+    # that interval.
+    def wait_for_stop
+      loop do
+        stop if @stop_requested_by_signal
+        return if @stopped
+        return if @stop_channel.received?
+
+        sleep SIGNAL_POLL_INTERVAL
       end
     end
 
@@ -228,6 +266,12 @@ module KrubyController
           @cond.wait(@mutex) until @value
           @value
         end
+      end
+
+      # Non-blocking check used by #wait_for_stop, which cannot block on
+      # #receive and also poll the signal flag in the same thread.
+      def received?
+        @mutex.synchronize { !@value.nil? }
       end
     end
   end

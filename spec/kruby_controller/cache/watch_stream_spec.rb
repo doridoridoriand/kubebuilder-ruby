@@ -143,6 +143,12 @@ RSpec.describe KrubyController::Cache::WatchStream do
       .to raise_error(described_class::Error) { |e| expect(e.retry_after).to be_nil }
   end
 
+  it "raises Gone for an HTTP 410 response (not only a streamed ERROR event)" do
+    response = double("response", code: 410, success?: false, headers: nil, body: "", status_message: "Gone")
+
+    expect { run!([], response: response) }.to raise_error(described_class::Gone) { |e| expect(e.code).to eq(410) }
+  end
+
   it "disables the idle timeout so an idle stream is not killed mid-poll" do
     request = run!([])
 

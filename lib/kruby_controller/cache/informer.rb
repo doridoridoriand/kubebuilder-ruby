@@ -119,7 +119,9 @@ module KrubyController
         while running?(generation) && attempt < POPULATE_MAX_ATTEMPTS
           attempt += 1
           begin
-            resp = fetch_list
+            resp = fetch_list(generation)
+            return unless resp # stopped mid-collection: discard the partial snapshot
+
             apply_list(resp, generation, initial: true)
             return
           rescue StandardError => e
@@ -178,11 +180,19 @@ module KrubyController
       # before anything is applied: a failure on page N leaves the store
       # untouched, and the caller's retry starts from page 1 — which is also
       # what an expired continue token (410 Gone) needs.
-      def fetch_list
+      #
+      # The caller's +generation+ is re-checked before EVERY page fetch: a
+      # #stop that lands between pages ends the collection immediately, so a
+      # stopped worker neither issues further API calls nor accumulates a
+      # partial snapshot that would race the next generation's LIST. Returns
+      # nil when the informer was stopped mid-collection.
+      def fetch_list(generation)
         items = []
         continue = nil
         resource_version = nil
         loop do
+          return nil unless running?(generation)
+
           path = paged_list_path(continue)
           response = run_list_request(path)
           page = JSON.parse(response.body)
@@ -298,11 +308,15 @@ module KrubyController
 
       # Re-Lists the resource, replaces the store contents, and emits
       # ADDED / MODIFIED / DELETED events for the diff so controllers
-      # reconcile the state that changed while the watch was down.
+      # reconcile the state that changed while the watch was down. A stop
+      # that lands mid-collection (fetch_list returns nil) discards the
+      # partial snapshot and ends the relist.
       def relist(generation)
         return unless running?(generation)
 
-        resp = fetch_list
+        resp = fetch_list(generation)
+        return unless resp
+
         apply_list(resp, generation)
       rescue StandardError => e
         return unless running?(generation)

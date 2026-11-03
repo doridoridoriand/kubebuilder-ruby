@@ -4,6 +4,27 @@ require "timeout"
 
 InformerGVK = Struct.new(:group, :version, :kind, :resource)
 
+# A request fake whose run blocks on a gate before returning its page, so a
+# spec can stop the informer while a list page is still in flight.
+class GatedPageRequest
+  attr_reader :options
+
+  def initialize(gate, response)
+    @gate = gate
+    @response = response
+    @options = {}
+  end
+
+  def on_headers = nil
+
+  def on_body = nil
+
+  def run
+    @gate.pop
+    @response
+  end
+end
+
 class InformerSpecEventRecorder
   attr_reader :events
 
@@ -327,11 +348,34 @@ RSpec.describe KrubyController::Cache::Informer do
                                                     body: { "items" => [item("b", "2")], "metadata" => {} }.to_json)
                                            ])
 
-      expect { paged.send(:fetch_list) }.to raise_error(KrubyController::Cache::RequestError, /resourceVersion/)
+      expect { paged.send(:fetch_list, generation) }.to raise_error(KrubyController::Cache::RequestError, /resourceVersion/)
 
       allow(paged).to receive(:interruptible_sleep).and_return(nil)
       paged.send(:populate, generation)
       expect(paged.store.list).to be_empty
+      expect(paged.synced).to be false
+    end
+
+    it "discards the partial snapshot and stops when the informer is stopped mid-list" do
+      page_gate = ::Queue.new
+      requested_paths = []
+      client = instance_double(Kubernetes::ApiClient)
+      allow(client).to receive(:build_request) do |_method, path, **_opts|
+        requested_paths << path
+        held_page = page(items: [item("a", "1")], continue_token: "tok#{requested_paths.size}")
+        GatedPageRequest.new(page_gate, held_page)
+      end
+      paged = described_class.new(gvk: gvk, store: KrubyController::Cache::Store.new, api_client: client)
+      paged.instance_variable_set(:@running, true)
+      collector = Thread.new { paged.send(:populate, paged.instance_variable_get(:@generation)) }
+
+      Timeout.timeout(3) { sleep 0.01 until requested_paths.size >= 1 }
+      paged.stop # lands while page 1 is still in flight
+      page_gate << nil # the in-flight request returns now
+
+      Timeout.timeout(3) { collector.join }
+      expect(requested_paths.size).to eq(1) # no page 2 was requested after the stop
+      expect(paged.store.list).to be_empty # the partial snapshot was never applied
       expect(paged.synced).to be false
     end
 

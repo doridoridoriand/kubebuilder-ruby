@@ -18,7 +18,8 @@ module KrubyController
       renew_deadline: 10,
       retry_period: 2,
       stop_timeout: 30,
-      logger: nil
+      logger: nil,
+      list_page_size: nil
     )
       @kube_config = kube_config
       @namespace = namespace
@@ -26,7 +27,7 @@ module KrubyController
       @lease_opts = { lease_name:, lease_namespace:, lease_duration:, renew_deadline:, retry_period: }
       @stop_timeout = stop_timeout
       @logger = logger
-      @cache = Cache::SharedCache.new(kube_config:, namespace:)
+      @cache = Cache::SharedCache.new(kube_config:, namespace:, list_page_size:)
       @controllers = []
       @stopped = false
       @stop_requested_by_signal = false

@@ -1594,6 +1594,9 @@ Main Thread
 **対応**: Informer は watch ループを try/rescue + sleep/backoff でラップ。resourceVersion を保持し、直地点から再開。
 
 **#45 追記 (2026-11-03)**: kruby の `Watch` は 410 Gone を内部で自動再接続する (`current_resource_version = nil` で "now" から watch) — これは古い RV と再接続の間のイベントを**無音で欠損**させる。そのため Informer は kruby の Watch を使わず、自前の `WatchStream` (ApiClient 直構築・on_body ストリーミング・自動再接続なし・idle タイムアウト無効) で watch する。ERROR イベントも含めて全イベントを Informer に渡し、分類 (ADDED/MODIFIED/DELETED → store+handler、BOOKMARK → RV のみ、ERROR 410 → 即 relist、その他 ERROR → バックオフ後に relist) は Informer 側が行う。
+- 不正データイベント (null、または RV 以外の metadata のみ) はログして無視し、RV を unkeyable なオブジェクトに更新しない (watch が盲目にならない)。
+- ストリーム内 ERROR (429/5xx) は `details.retryAfterSeconds` をバックオフに反映 (200 の watch レスポンスには HTTP の Retry-After ヘッダがないため)。
+- HTTP 410 レスポンス (ストリーム内 ERROR イベントと同一形態) は即 relist 経路。200 レスポンス後の本転送失敗は clean close ではなくエラーとして surface。Retry-After は delta-seconds と HTTP-date の両形式をサポート。
 
 ### 9.3 CRD Generator の完全性
 

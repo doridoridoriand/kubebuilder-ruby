@@ -169,6 +169,66 @@ RSpec.describe KrubyController::Cache::Informer do
       expect(informer.instance_variable_get(:@resource_version)).to eq("10")
     end
 
+    it "carries the Status retryAfterSeconds onto a non-410 ERROR (e.g. a streamed 429)" do
+      informer.instance_variable_set(:@resource_version, "10")
+
+      expect do
+        informer.send(
+          :handle_watch_event,
+          { "type" => "ERROR",
+            "object" => { "code" => 429, "reason" => "TooManyRequests",
+                          "details" => { "retryAfterSeconds" => 30 } } },
+          generation
+        )
+      end.to raise_error(KrubyController::Cache::WatchStream::Error) do |e|
+        expect(e.code).to eq(429)
+        expect(e.retry_after).to eq(30.0)
+      end
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+    end
+
+    it "ignores a nameless ADDED object and does not advance the RV to it" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "ADDED", "object" => { "metadata" => { "resourceVersion" => "999" } } },
+        generation
+      )
+
+      # no RV advancement, no store entry, no delivery
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(store.list).to be_empty
+      expect(recorder.events).to be_empty
+    end
+
+    it "ignores a null-object data event without raising" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(:handle_watch_event, { "type" => "MODIFIED", "object" => nil }, generation)
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(store.list).to be_empty
+      expect(recorder.events).to be_empty
+    end
+
+    it "still stores and notifies a well-formed ADDED object" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "ADDED", "object" => { "metadata" => { "namespace" => "default", "name" => "ok", "resourceVersion" => "11" } } },
+        generation
+      )
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("11")
+      expect(recorder.events.size).to eq(1)
+    end
+
     it "ignores unknown event types without touching the RV or the store" do
       informer.add_handler(recorder)
       informer.instance_variable_set(:@resource_version, "10")

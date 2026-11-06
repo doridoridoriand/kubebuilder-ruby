@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "json"
+require "time"
 
 module KrubyController
   module Cache
@@ -28,15 +29,24 @@ module KrubyController
         new(message, code: code, retry_after: retry_after)
       end
 
+      # Parses a Retry-After value in either form allowed by RFC 7231: a
+      # non-negative integer of seconds, or an HTTP-date. HTTP-dates are
+      # converted to the remaining delay; invalid or already-past values are
+      # discarded (nil) so the caller falls back to its own backoff.
       def self.parse_retry_after(response)
         headers = response.respond_to?(:headers) ? response.headers : nil
         return nil if headers.nil?
 
-        value = headers["Retry-After"]
-        return nil if value.nil? || value.to_s.empty?
+        value = headers["Retry-After"] || headers["retry-after"]
+        return nil if value.nil? || value.to_s.strip.empty?
 
-        seconds = value.to_f
-        seconds.positive? ? seconds : nil
+        value = value.to_s.strip
+        if value.match?(/\A\d+(\.\d+)?\z/)
+          delay = value.to_f
+        else
+          delay = Time.httpdate(value) - Time.now
+        end
+        delay.is_a?(Numeric) && delay.positive? ? delay : nil
       rescue StandardError
         nil
       end

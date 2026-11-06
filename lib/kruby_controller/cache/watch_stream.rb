@@ -88,17 +88,35 @@ module KrubyController
       end
 
       def check_response(response, headers_seen)
+        return if transfer_ok?(response, headers_seen)
+
         source = response || headers_seen
-        return if source.nil? || success_code?(source)
 
         # Some API servers reject a stale watch resourceVersion with an HTTP
         # 410 response instead of a streamed ERROR event; both forms must
         # take the same recovery path (immediate relist, no backoff).
-        if source.code.to_i == 410
+        if response && response.code.to_i == 410
           raise WatchStream::Gone.new("watch resourceVersion expired (410 Gone)", code: 410)
         end
 
         raise WatchStream::Error.from_response("Watch request failed", source)
+      end
+
+      # A transfer is clean when the completed response reports success. A
+      # Typhoeus response can keep code == 200 (read from the headers) while
+      # success? is false after the body transfer failed mid-stream — that
+      # must surface as an error (so the informer backs off) rather than a
+      # clean close. When only headers exist (no completed response), the
+      # status code is all we have, so fall back to the code check.
+      def transfer_ok?(response, headers_seen)
+        # A completed response knows about body-transfer failures the status
+        # code alone does not reflect, so trust success? when we have one.
+        return response.success? if response && response.respond_to?(:success?)
+
+        # Headers only: no body, so the status code is the whole picture.
+        return false if headers_seen.nil?
+
+        success_code?(headers_seen)
       end
 
       # Splits +buffer+ into the complete newline-terminated lines and the

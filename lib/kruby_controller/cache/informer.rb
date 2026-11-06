@@ -277,18 +277,29 @@ module KrubyController
       # resourceVersion for the current state and only advances the RV —
       # nothing is stored or delivered. ERROR events raise: 410 Gone tells
       # watch_loop to relist immediately, anything else disconnects the
-      # stream and backs off before relisting. Unknown or malformed events
-      # are logged and ignored without touching the RV.
+      # stream and backs off (honoring a Status retryAfterSeconds) before
+      # relisting. Unknown or malformed events are logged and ignored without
+      # touching the RV.
       def handle_watch_event(event, generation)
         obj = event["object"]
         case event["type"]
         when "ADDED", "MODIFIED", "DELETED"
-          rv = obj.is_a?(Hash) ? obj.dig("metadata", "resourceVersion") : nil
-          @resource_version = rv unless missing_rv?(rv)
+          unless valid_data_object?(obj)
+            # A data event must name a real object; a null or nameless payload
+            # (e.g. an object carrying only metadata.resourceVersion) cannot
+            # be keyed or delivered, so ignore it — and do NOT advance the RV
+            # to it, which would blind the next watch.
+            KrubyController.logger.warn(
+              "Informer #{@gvk}: ignoring malformed #{event["type"]} watch event: #{truncate(obj.inspect)}"
+            )
+            return
+          end
 
-          type = delta_type(event)
-          @store.add(type, obj)
-          notify(type, obj, generation)
+          delta = delta_type(event)
+          @resource_version = obj.dig("metadata", "resourceVersion") unless missing_rv?(obj.dig("metadata", "resourceVersion"))
+
+          @store.add(delta, obj)
+          notify(delta, obj, generation)
         when "BOOKMARK"
           rv = obj.is_a?(Hash) ? obj.dig("metadata", "resourceVersion") : nil
           @resource_version = rv unless missing_rv?(rv)
@@ -298,12 +309,43 @@ module KrubyController
             raise WatchStream::Gone.new("watch resourceVersion expired (410 Gone)", code: 410)
           end
 
-          raise WatchStream::Error.new("watch ERROR event (code: #{code.inspect})", code: code)
+          # A streamed 429/5xx Status carries its retry delay in
+          # details.retryAfterSeconds — the HTTP Retry-After parser cannot
+          # see it (the watch response itself is a 200), so surface it here.
+          raise WatchStream::Error.new(
+            "watch ERROR event (code: #{code.inspect})", code: code, retry_after: status_retry_after(obj)
+          )
         else
           KrubyController.logger.warn(
             "Informer #{@gvk}: unclassified watch event type #{event["type"].inspect}; ignoring"
           )
         end
+      end
+
+      # A data event must be a real named object: a Hash with a Hash metadata
+      # block and a nonempty name. Everything else (null, wrong types, a
+      # nameless payload) is malformed for storage and delivery.
+      def valid_data_object?(obj)
+        obj.is_a?(Hash) && obj["metadata"].is_a?(Hash) && !obj.dig("metadata", "name").to_s.empty?
+      end
+
+      # Extracts a valid positive retry delay (seconds) from a watch ERROR
+      # Status object's details.retryAfterSeconds, or nil when absent/invalid.
+      def status_retry_after(obj)
+        return nil unless obj.is_a?(Hash)
+
+        value = obj.dig("details", "retryAfterSeconds")
+        return nil if value.nil?
+
+        delay = value.to_f
+        delay.positive? ? delay : nil
+      rescue StandardError
+        nil
+      end
+
+      def truncate(text, limit: 200)
+        text = text.to_s
+        text.length > limit ? "#{text[0...limit]}..." : text
       end
 
       # Re-Lists the resource, replaces the store contents, and emits

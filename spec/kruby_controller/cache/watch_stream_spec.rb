@@ -149,6 +149,23 @@ RSpec.describe KrubyController::Cache::WatchStream do
     expect { run!([], response: response) }.to raise_error(described_class::Gone) { |e| expect(e.code).to eq(410) }
   end
 
+  it "raises Error when the body transfer fails after a 200 (code 200, success? false)" do
+    # A mid-stream body reset keeps the 200 status code (from the headers)
+    # but marks the transfer as unsuccessful; that must not be a clean close.
+    response = double("response", code: 200, success?: false, headers: nil,
+                      body: "", status_message: "OK (interrupted)")
+
+    expect { run!([], response: response) }
+      .to raise_error(described_class::Error) { |e| expect(e.code).to eq(200) }
+  end
+
+  it "treats a fully successful 200 as a clean close even with no events" do
+    request = run!([])
+
+    expect(events).to be_empty
+    expect(request.run).to be_truthy
+  end
+
   it "disables the idle timeout so an idle stream is not killed mid-poll" do
     request = run!([])
 

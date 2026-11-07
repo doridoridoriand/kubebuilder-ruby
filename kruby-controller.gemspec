@@ -16,10 +16,12 @@ Gem::Specification.new do |spec|
   spec.required_ruby_version = ">= 3.3.0"
 
   spec.metadata["homepage_uri"] = spec.homepage
-  spec.metadata["source_code_uri"] = spec.homepage
   spec.metadata["changelog_uri"] = "#{spec.homepage}/blob/main/CHANGELOG.md"
 
-  spec.files = Dir.glob("{lib,exe}/**/*", File::FNM_DOTMATCH) +
+  # Package only the runtime files. Without FNM_DOTMATCH the glob skips
+  # dotfiles (e.g. a stray .DS_Store on a developer's machine is never
+  # bundled), and directories are dropped so the spec lists real files only.
+  spec.files = Dir.glob("{lib,exe}/**/*").reject { |f| File.directory?(f) } +
                %w[LICENSE README.md Rakefile]
   spec.require_paths = ["lib"]
   spec.bindir = "exe"

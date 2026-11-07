@@ -46,6 +46,8 @@ module KrubyController
   # Cache
   require_relative "kruby_controller/cache/delta"
   require_relative "kruby_controller/cache/deep_copy"
+  require_relative "kruby_controller/cache/request_error"
+  require_relative "kruby_controller/cache/watch_stream"
   require_relative "kruby_controller/cache/store"
   require_relative "kruby_controller/cache/informer"
   require_relative "kruby_controller/cache/cache"

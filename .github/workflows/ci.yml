@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Ruby ${{ matrix.ruby }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Gemfile / gemspec require >= 3.3.0; rubocop targets 3.3.
+        ruby: ["3.3", "3.4"]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+
+      - name: Run specs
+        run: bundle exec rake
+
+      - name: Build and validate the gem
+        run: |
+          bundle exec rake build
+          gem spec pkg/kruby-controller-*.gem

@@ -3,9 +3,11 @@
 module KrubyController
   module Cache
     class SharedCache
-      def initialize(kube_config: nil, namespace: nil)
+      def initialize(kube_config: nil, namespace: nil, list_page_size: nil)
         @kube_config = kube_config
         @namespace = namespace
+        # Optional page size for every informer's paged LIST (issue #45).
+        @list_page_size = list_page_size
         @informers = {}
         @mutex = Mutex.new
       end
@@ -15,7 +17,8 @@ module KrubyController
           return @informers[gvk.to_s] if @informers.key?(gvk.to_s)
 
           store = Store.new
-          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [], namespace: @namespace)
+          informer = Informer.new(gvk:, store:, api_client: api_client, handlers: [], namespace: @namespace,
+                                  list_page_size: @list_page_size)
           @informers[gvk.to_s] = informer
           informer
         end

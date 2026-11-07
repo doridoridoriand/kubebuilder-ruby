@@ -146,6 +146,18 @@ RSpec.describe KrubyController::Manager do
     end
   end
 
+  describe "list_page_size option (#45)" do
+    it "threads list_page_size into every informer it registers" do
+      manager = described_class.new(list_page_size: 250)
+      gvk = KrubyController::GVK.new(group: "g", version: "v1", kind: "Widget")
+
+      allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
+      informer = manager.cache.register(gvk: gvk)
+
+      expect(informer.list_page_size).to eq(250)
+    end
+  end
+
   describe "startup failure (cache cannot sync)" do
     it "stops components and raises when the cache cannot sync (no leader election)" do
       manager = described_class.new(leader_elect: false)
@@ -240,8 +252,8 @@ RSpec.describe KrubyController::Manager do
     it "starts workers only after every informer is synced (FR-03)" do
       manager = described_class.new(leader_elect: false)
       allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
 
       informer_crontask = manager.cache.register(gvk: crontask_gvk)
@@ -365,8 +377,8 @@ RSpec.describe KrubyController::Manager do
       # from inflating the spec when the informer is stopped between
       # leadership generations.
       stub_const("KrubyController::Cache::Informer::STOP_JOIN_TIMEOUT", 0.05)
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       # Park the watch in connect so no relist races the lifecycle handover;
       # events flow only through the initial List of each generation.
       allow(fake_watch).to receive(:connect) { sleep }
@@ -451,8 +463,8 @@ RSpec.describe KrubyController::Manager do
     it "returns from stop within the drain budget while a reconcile is unresponsive" do
       manager = described_class.new(leader_elect: false, stop_timeout: 1)
       allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
 
       informer = manager.cache.register(gvk: crontask_gvk)
@@ -488,8 +500,8 @@ RSpec.describe KrubyController::Manager do
       allow(manager).to receive(:coordination_client).and_return(client)
       allow(manager).to receive(:setup_signal_handlers)
       allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
 
       informer = manager.cache.register(gvk: crontask_gvk)
@@ -522,8 +534,8 @@ RSpec.describe KrubyController::Manager do
     it "returns from start only after the stop cleanup completes" do
       manager = described_class.new(leader_elect: false, stop_timeout: 1)
       allow(manager.cache).to receive(:api_client).and_return(instance_double(Kubernetes::ApiClient))
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       allow(fake_watch).to receive(:connect).and_raise(KrubyController::Error, "test watch closed")
 
       informer = manager.cache.register(gvk: crontask_gvk)

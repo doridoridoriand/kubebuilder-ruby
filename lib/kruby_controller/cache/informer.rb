@@ -1,19 +1,23 @@
 # frozen_string_literal: true
 
+require "cgi"
 require "json"
 require "monitor"
 
 module KrubyController
   module Cache
     class Informer
-      attr_reader :store, :gvk, :synced, :sync_error
+      attr_reader :store, :gvk, :synced, :sync_error, :list_page_size
 
-      def initialize(gvk:, store:, api_client:, handlers: [], namespace: nil)
+      def initialize(gvk:, store:, api_client:, handlers: [], namespace: nil, list_page_size: nil)
         @gvk = gvk
         @store = store
         @api_client = api_client
         @handlers = handlers
         @namespace = namespace
+        # Optional page size for paged LISTs (issue #45). nil sends no limit
+        # and simply follows the server's continue tokens.
+        @list_page_size = list_page_size
         @resource_version = nil
         @running = false
         @started = false
@@ -115,7 +119,9 @@ module KrubyController
         while running?(generation) && attempt < POPULATE_MAX_ATTEMPTS
           attempt += 1
           begin
-            resp = fetch_list
+            resp = fetch_list(generation)
+            return unless resp # stopped mid-collection: discard the partial snapshot
+
             apply_list(resp, generation, initial: true)
             return
           rescue StandardError => e
@@ -129,7 +135,7 @@ module KrubyController
               return
             end
 
-            interruptible_sleep(backoff, generation)
+            interruptible_sleep(respect_retry_after(e, backoff), generation)
             return unless running?(generation)
 
             backoff = [backoff * 2, POPULATE_MAX_BACKOFF].min
@@ -148,6 +154,13 @@ module KrubyController
         end
       end
 
+      # Honors the server's Retry-After when present (issue #45): wait at
+      # least that long, or the caller's own backoff, whichever is longer.
+      def respect_retry_after(error, fallback)
+        retry_after = error.respond_to?(:retry_after) ? error.retry_after : nil
+        [retry_after, fallback].compact.max
+      end
+
       # Joins +thread+ for at most +timeout+ seconds. Returns once the thread
       # has exited; if it is still alive (e.g. blocked in a watch stream that
       # cannot be canceled), logs a warning and returns so the caller is not
@@ -162,15 +175,54 @@ module KrubyController
         )
       end
 
-      def fetch_list
-        list_path = list_path_for(@gvk)
-        request = @api_client.build_request("GET", list_path, auth_names: ["BearerToken"])
-        response = request.run
-        unless response.success?
-          raise KrubyController::Error,
-                "Informer list failed for #{@gvk} at #{list_path} (HTTP #{response.code}): #{response.status_message}"
+      # Lists the resource, following metadata.continue tokens until the
+      # collection is exhausted (issue #45). The whole snapshot is collected
+      # before anything is applied: a failure on page N leaves the store
+      # untouched, and the caller's retry starts from page 1 — which is also
+      # what an expired continue token (410 Gone) needs.
+      #
+      # The caller's +generation+ is re-checked before EVERY page fetch: a
+      # #stop that lands between pages ends the collection immediately, so a
+      # stopped worker neither issues further API calls nor accumulates a
+      # partial snapshot that would race the next generation's LIST. Returns
+      # nil when the informer was stopped mid-collection.
+      def fetch_list(generation)
+        items = []
+        continue = nil
+        resource_version = nil
+        loop do
+          return nil unless running?(generation)
+
+          path = paged_list_path(continue)
+          response = run_list_request(path)
+          page = JSON.parse(response.body)
+          raise RequestError.new("Informer list response for #{@gvk} has no items array") unless page["items"].is_a?(Array)
+
+          items.concat(page["items"])
+          resource_version = page.dig("metadata", "resourceVersion")
+          continue = page.dig("metadata", "continue")
+          break if continue.nil? || continue.empty?
         end
-        JSON.parse(response.body)
+
+        # Every page of one logical LIST shares the snapshot resourceVersion
+        # pinned by the continue token, so the final page's RV is the
+        # snapshot's RV. A missing RV is a protocol violation: continuing
+        # with a nil RV would make every subsequent watch start blind.
+        raise RequestError.new("Informer list response for #{@gvk} has no resourceVersion") if missing_rv?(resource_version)
+
+        { "items" => items, "metadata" => { "resourceVersion" => resource_version } }
+      end
+
+      def missing_rv?(value)
+        value.nil? || value.to_s.empty?
+      end
+
+      def run_list_request(path)
+        request = @api_client.build_request("GET", path, auth_names: ["BearerToken"])
+        response = request.run
+        return response if response.success?
+
+        raise RequestError.from_response("Informer list failed for #{@gvk} at #{path}", response)
       end
 
       def watch_loop(generation)
@@ -190,49 +242,137 @@ module KrubyController
       end
 
       # Runs a single watch from the current resourceVersion. Any break --
-      # 410 Gone (stale RV), 404, network error, or a clean server-side
-      # close -- falls through to relist, which re-syncs the cache.
+      # 410 Gone (stale RV), another ERROR event, HTTP error, network error,
+      # or a clean server-side close -- falls through to relist, which
+      # re-syncs the cache. A 410 relists immediately; every other failure
+      # backs off first (honoring Retry-After when present).
       def watch_once(generation)
         watch_path = with_active_run(generation) { watch_path_for(@gvk, @resource_version) }
         return unless watch_path
 
-        watch = Kubernetes::Watch.new(@api_client)
-        watch.connect(watch_path) do |event|
+        stream = WatchStream.new(@api_client)
+        stream.connect(watch_path) do |event|
           with_active_run(generation) do
-            type = delta_type(event)
-            obj = event["object"]
-            @resource_version = obj.dig("metadata", "resourceVersion")
-            @store.add(type, obj)
-            notify(type, obj, generation)
+            handle_watch_event(event, generation)
           end
         end
+      rescue WatchStream::Gone
+        return unless running?(generation)
+
+        KrubyController.logger.info("Watch for #{@gvk}: resourceVersion expired (410 Gone); relisting")
+      rescue WatchStream::Error => e
+        return unless running?(generation)
+
+        KrubyController.logger.warn("Watch for #{@gvk} disconnected: #{e.message}; relisting")
+        interruptible_sleep(respect_retry_after(e, 1.0), generation)
       rescue StandardError => e
         return unless running?(generation)
 
         KrubyController.logger.warn("Watch for #{@gvk} disconnected: #{e.message}; relisting")
-        interruptible_sleep(1, generation)
+        interruptible_sleep(1.0, generation)
+      end
+
+      # Classifies a watch event (issue #45). Only ADDED / MODIFIED /
+      # DELETED reach the store and the handlers. BOOKMARK carries a valid
+      # resourceVersion for the current state and only advances the RV —
+      # nothing is stored or delivered. ERROR events raise: 410 Gone tells
+      # watch_loop to relist immediately, anything else disconnects the
+      # stream and backs off (honoring a Status retryAfterSeconds) before
+      # relisting. Unknown or malformed events are logged and ignored without
+      # touching the RV.
+      def handle_watch_event(event, generation)
+        obj = event["object"]
+        case event["type"]
+        when "ADDED", "MODIFIED", "DELETED"
+          unless valid_data_object?(obj)
+            # A data event must name a real object; a null or nameless payload
+            # (e.g. an object carrying only metadata.resourceVersion) cannot
+            # be keyed or delivered, so ignore it — and do NOT advance the RV
+            # to it, which would blind the next watch.
+            KrubyController.logger.warn(
+              "Informer #{@gvk}: ignoring malformed #{event["type"]} watch event: #{truncate(obj.inspect)}"
+            )
+            return
+          end
+
+          delta = delta_type(event)
+          @resource_version = obj.dig("metadata", "resourceVersion") unless missing_rv?(obj.dig("metadata", "resourceVersion"))
+
+          @store.add(delta, obj)
+          notify(delta, obj, generation)
+        when "BOOKMARK"
+          rv = obj.is_a?(Hash) ? obj.dig("metadata", "resourceVersion") : nil
+          @resource_version = rv unless missing_rv?(rv)
+        when "ERROR"
+          code = obj.is_a?(Hash) ? obj["code"] : nil
+          if code == 410
+            raise WatchStream::Gone.new("watch resourceVersion expired (410 Gone)", code: 410)
+          end
+
+          # A streamed 429/5xx Status carries its retry delay in
+          # details.retryAfterSeconds — the HTTP Retry-After parser cannot
+          # see it (the watch response itself is a 200), so surface it here.
+          raise WatchStream::Error.new(
+            "watch ERROR event (code: #{code.inspect})", code: code, retry_after: status_retry_after(obj)
+          )
+        else
+          KrubyController.logger.warn(
+            "Informer #{@gvk}: unclassified watch event type #{event["type"].inspect}; ignoring"
+          )
+        end
+      end
+
+      # A data event must be a real named object: a Hash with a Hash metadata
+      # block and a nonempty name. Everything else (null, wrong types, a
+      # nameless payload) is malformed for storage and delivery.
+      def valid_data_object?(obj)
+        obj.is_a?(Hash) && obj["metadata"].is_a?(Hash) && !obj.dig("metadata", "name").to_s.empty?
+      end
+
+      # Extracts a valid positive retry delay (seconds) from a watch ERROR
+      # Status object's details.retryAfterSeconds, or nil when absent/invalid.
+      def status_retry_after(obj)
+        return nil unless obj.is_a?(Hash)
+
+        value = obj.dig("details", "retryAfterSeconds")
+        return nil if value.nil?
+
+        delay = value.to_f
+        delay.positive? ? delay : nil
+      rescue StandardError
+        nil
+      end
+
+      def truncate(text, limit: 200)
+        text = text.to_s
+        text.length > limit ? "#{text[0...limit]}..." : text
       end
 
       # Re-Lists the resource, replaces the store contents, and emits
       # ADDED / MODIFIED / DELETED events for the diff so controllers
-      # reconcile the state that changed while the watch was down.
+      # reconcile the state that changed while the watch was down. A stop
+      # that lands mid-collection (fetch_list returns nil) discards the
+      # partial snapshot and ends the relist.
       def relist(generation)
         return unless running?(generation)
 
-        resp = fetch_list
+        resp = fetch_list(generation)
+        return unless resp
+
         apply_list(resp, generation)
       rescue StandardError => e
         return unless running?(generation)
 
-        KrubyController.logger.warn("Informer relist failed for #{@gvk}: #{e.message}; retrying in 1s")
-        interruptible_sleep(1, generation)
+        KrubyController.logger.warn("Informer relist failed for #{@gvk}: #{e.message}; retrying")
+        interruptible_sleep(respect_retry_after(e, 1.0), generation)
         retry if running?(generation)
       end
 
       def apply_list(resp, generation, initial: false)
         with_active_run(generation) do
           old, new = @store.replace(resp["items"] || [])
-          @resource_version = resp.dig("metadata", "resourceVersion")
+          new_rv = resp.dig("metadata", "resourceVersion")
+          @resource_version = new_rv unless missing_rv?(new_rv)
           emit_relist_events(old, new, generation)
           @synced = true if initial && running?(generation)
         end
@@ -283,6 +423,17 @@ module KrubyController
                 end
 
         "#{prefix}#{scope}/#{gvk.resource}"
+      end
+
+      # Adds the optional page size and the continue token for a paged LIST
+      # (issue #45). The bare path is unchanged when neither applies.
+      def paged_list_path(continue)
+        params = []
+        params << "limit=#{@list_page_size}" if @list_page_size
+        params << "continue=#{CGI.escape(continue)}" if continue
+        return list_path_for(@gvk) if params.empty?
+
+        "#{list_path_for(@gvk)}?#{params.join('&')}"
       end
 
       def watch_path_for(gvk, resource_version)

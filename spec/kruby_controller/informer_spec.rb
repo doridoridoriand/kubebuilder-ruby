@@ -4,6 +4,27 @@ require "timeout"
 
 InformerGVK = Struct.new(:group, :version, :kind, :resource)
 
+# A request fake whose run blocks on a gate before returning its page, so a
+# spec can stop the informer while a list page is still in flight.
+class GatedPageRequest
+  attr_reader :options
+
+  def initialize(gate, response)
+    @gate = gate
+    @response = response
+    @options = {}
+  end
+
+  def on_headers = nil
+
+  def on_body = nil
+
+  def run
+    @gate.pop
+    @response
+  end
+end
+
 class InformerSpecEventRecorder
   attr_reader :events
 
@@ -90,6 +111,336 @@ RSpec.describe KrubyController::Cache::Informer do
 
       expect(store.get("default", "a").dig("spec", "steps").size).to eq(1)
       expect(recorder.events.size).to eq(1)
+    end
+  end
+
+  describe "watch event classification (#45)" do
+    let(:generation) { informer.instance_variable_get(:@generation) }
+    let(:recorder) { InformerSpecEventRecorder.new }
+
+    before { informer.instance_variable_set(:@running, true) }
+
+    it "updates the RV from a BOOKMARK without storing or notifying" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "BOOKMARK", "object" => { "metadata" => { "resourceVersion" => "12" } } },
+        generation
+      )
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("12")
+      expect(recorder.events).to be_empty
+      expect(store.list).to be_empty
+    end
+
+    it "does not corrupt the RV when an event object carries no resourceVersion" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "ADDED", "object" => { "metadata" => { "name" => "a" } } },
+        generation
+      )
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(store.get("", "a")).to be_a(Hash)
+    end
+
+    it "raises Gone for a 410 ERROR event and leaves the RV untouched" do
+      informer.instance_variable_set(:@resource_version, "10")
+
+      expect do
+        informer.send(:handle_watch_event, { "type" => "ERROR", "object" => { "code" => 410, "reason" => "Expired" } }, generation)
+      end.to raise_error(KrubyController::Cache::WatchStream::Gone)
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+    end
+
+    it "raises Error for other ERROR events without touching the RV" do
+      informer.instance_variable_set(:@resource_version, "10")
+
+      expect do
+        informer.send(:handle_watch_event, { "type" => "ERROR", "object" => { "code" => 500, "reason" => "boom" } }, generation)
+      end.to raise_error(KrubyController::Cache::WatchStream::Error) { |e| expect(e.code).to eq(500) }
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+    end
+
+    it "carries the Status retryAfterSeconds onto a non-410 ERROR (e.g. a streamed 429)" do
+      informer.instance_variable_set(:@resource_version, "10")
+
+      expect do
+        informer.send(
+          :handle_watch_event,
+          { "type" => "ERROR",
+            "object" => { "code" => 429, "reason" => "TooManyRequests",
+                          "details" => { "retryAfterSeconds" => 30 } } },
+          generation
+        )
+      end.to raise_error(KrubyController::Cache::WatchStream::Error) do |e|
+        expect(e.code).to eq(429)
+        expect(e.retry_after).to eq(30.0)
+      end
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+    end
+
+    it "ignores a nameless ADDED object and does not advance the RV to it" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "ADDED", "object" => { "metadata" => { "resourceVersion" => "999" } } },
+        generation
+      )
+
+      # no RV advancement, no store entry, no delivery
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(store.list).to be_empty
+      expect(recorder.events).to be_empty
+    end
+
+    it "ignores a null-object data event without raising" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(:handle_watch_event, { "type" => "MODIFIED", "object" => nil }, generation)
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(store.list).to be_empty
+      expect(recorder.events).to be_empty
+    end
+
+    it "still stores and notifies a well-formed ADDED object" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "ADDED", "object" => { "metadata" => { "namespace" => "default", "name" => "ok", "resourceVersion" => "11" } } },
+        generation
+      )
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("11")
+      expect(recorder.events.size).to eq(1)
+    end
+
+    it "ignores unknown event types without touching the RV or the store" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      informer.send(
+        :handle_watch_event,
+        { "type" => "SOMETHING_ELSE", "object" => { "metadata" => { "name" => "x" } } },
+        generation
+      )
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("10")
+      expect(recorder.events).to be_empty
+      expect(store.list).to be_empty
+    end
+
+    it "still stores and notifies the three data event types" do
+      informer.add_handler(recorder)
+      informer.instance_variable_set(:@resource_version, "10")
+
+      %w[ADDED MODIFIED DELETED].each_with_index do |type, i|
+        object = { "metadata" => { "namespace" => "default", "name" => "k#{i}", "resourceVersion" => (10 + i + 1).to_s } }
+        informer.send(:handle_watch_event, { "type" => type, "object" => object }, generation)
+      end
+
+      expect(informer.instance_variable_get(:@resource_version)).to eq("13")
+      expect(recorder.events.map(&:first)).to eq(
+        [KrubyController::Cache::Delta::ADDED, KrubyController::Cache::Delta::MODIFIED, KrubyController::Cache::Delta::DELETED]
+      )
+      expect(store.list.map { |o| o.dig("metadata", "name") }).to match_array(%w[k0 k1]) # DELETED removed k2
+      expect(store.get("default", "k0")).to be_a(Hash)
+      expect(store.get("default", "k1")).to be_a(Hash)
+    end
+  end
+
+  describe "watch failure handling (#45)" do
+    class InformerSpecStreamRequest
+      attr_reader :options
+
+      def initialize(response)
+        @response = response
+        @options = {}
+      end
+
+      def on_headers = nil
+
+      def on_body = nil
+
+      def run = @response
+    end
+
+    let(:generation) { informer.instance_variable_get(:@generation) }
+
+    before { informer.instance_variable_set(:@running, true) }
+
+    def stub_failed_response!(code:, retry_after: nil)
+      response = double(
+        "response",
+        code: code,
+        success?: false,
+        headers: retry_after ? { "Retry-After" => retry_after.to_s } : nil,
+        body: "",
+        status_message: "failed"
+      )
+      allow(api_client).to receive(:build_request).and_return(InformerSpecStreamRequest.new(response))
+      response
+    end
+
+    it "sleeps for the server's Retry-After before relisting" do
+      stub_failed_response!(code: 429, retry_after: 7)
+      allow(informer).to receive(:interruptible_sleep).and_return(nil)
+      allow(informer).to receive(:fetch_list).and_return({ "items" => [], "metadata" => { "resourceVersion" => "5" } })
+
+      informer.send(:watch_once, generation)
+
+      expect(informer).to have_received(:interruptible_sleep).with(7.0, anything)
+    end
+
+    it "falls back to a 1s backoff when no Retry-After is present" do
+      stub_failed_response!(code: 503)
+      allow(informer).to receive(:interruptible_sleep).and_return(nil)
+      allow(informer).to receive(:fetch_list).and_return({ "items" => [], "metadata" => { "resourceVersion" => "5" } })
+
+      informer.send(:watch_once, generation)
+
+      expect(informer).to have_received(:interruptible_sleep).with(1.0, anything)
+    end
+  end
+
+  describe "paged list (#45)" do
+    let(:generation) { informer.instance_variable_get(:@generation) }
+
+    before { informer.instance_variable_set(:@running, true) }
+
+    def page(items:, continue_token: nil, rv: "500")
+      metadata = { "resourceVersion" => rv }
+      metadata["continue"] = continue_token if continue_token
+      double("list response", success?: true, code: 200, body: { "items" => items, "metadata" => metadata }.to_json)
+    end
+
+    def failed_page(code:, headers: nil)
+      double("failed response", success?: false, code: code, headers: headers, body: "", status_message: "failed")
+    end
+
+    def build_paged_informer(pages, page_size: nil)
+      pending_pages = pages.dup
+      paths = []
+      client = instance_double(Kubernetes::ApiClient)
+      allow(client).to receive(:build_request) do |_method, path, **_opts|
+        paths << path
+        response = pending_pages.shift
+        response = failed_page(code: 500) if response.nil? # keep retrying failures fast
+        double("request", run: response)
+      end
+      informer = described_class.new(gvk: gvk, store: KrubyController::Cache::Store.new, api_client: client,
+                                     list_page_size: page_size)
+      informer.instance_variable_set(:@running, true) # populate's while loop requires an active run
+      [informer, paths]
+    end
+
+    it "collects every page before applying the snapshot atomically" do
+      paged, _paths = build_paged_informer([
+                                             page(items: [item("a", "1"), item("b", "2")], continue_token: "tok1"),
+                                             page(items: [item("c", "3")], continue_token: "tok2"),
+                                             page(items: [item("d", "4")])
+                                           ])
+
+      paged.send(:populate, generation)
+
+      expect(paged.synced).to be true
+      expect(paged.instance_variable_get(:@resource_version)).to eq("500")
+      expect(paged.store.list.map { |o| o.dig("metadata", "name") }).to match_array(%w[a b c d])
+    end
+
+    it "leaves the store untouched when a page fails mid-collection" do
+      paged, _paths = build_paged_informer([
+                                             page(items: [item("a", "1")], continue_token: "tok1"),
+                                             failed_page(code: 503)
+                                           ])
+      allow(paged).to receive(:interruptible_sleep).and_return(nil)
+
+      paged.send(:populate, generation)
+
+      expect(paged.store.list).to be_empty
+      expect(paged.synced).to be false
+    end
+
+    it "restarts from the first page when a continue token expires (410)" do
+      paged, paths = build_paged_informer([
+                                            page(items: [item("a", "1")], continue_token: "tok1"),
+                                            failed_page(code: 410),
+                                            page(items: [item("a", "1")], continue_token: "tok1b"),
+                                            page(items: [item("b", "2")])
+                                          ])
+
+      paged.send(:populate, generation)
+
+      expect(paged.store.list.map { |o| o.dig("metadata", "name") }).to match_array(%w[a b])
+      expect(paged.synced).to be true
+      base = paged.send(:list_path_for, paged.gvk)
+      expect(paths.count(base)).to eq(2) # the retry started from page 1
+    end
+
+    it "sends the configured page size as a limit parameter" do
+      paged, paths = build_paged_informer([page(items: [], rv: "500")], page_size: 250)
+
+      paged.send(:populate, generation)
+
+      expect(paged.list_page_size).to eq(250)
+      expect(paths.first).to include("limit=250")
+      expect(paged.synced).to be true
+    end
+
+    it "rejects a final page with no resourceVersion instead of blinding the watch" do
+      paged, _paths = build_paged_informer([
+                                             page(items: [item("a", "1")], continue_token: "tok1"),
+                                             double("bad page", success?: true, code: 200,
+                                                    body: { "items" => [item("b", "2")], "metadata" => {} }.to_json)
+                                           ])
+
+      expect { paged.send(:fetch_list, generation) }.to raise_error(KrubyController::Cache::RequestError, /resourceVersion/)
+
+      allow(paged).to receive(:interruptible_sleep).and_return(nil)
+      paged.send(:populate, generation)
+      expect(paged.store.list).to be_empty
+      expect(paged.synced).to be false
+    end
+
+    it "discards the partial snapshot and stops when the informer is stopped mid-list" do
+      page_gate = ::Queue.new
+      requested_paths = []
+      client = instance_double(Kubernetes::ApiClient)
+      allow(client).to receive(:build_request) do |_method, path, **_opts|
+        requested_paths << path
+        held_page = page(items: [item("a", "1")], continue_token: "tok#{requested_paths.size}")
+        GatedPageRequest.new(page_gate, held_page)
+      end
+      paged = described_class.new(gvk: gvk, store: KrubyController::Cache::Store.new, api_client: client)
+      paged.instance_variable_set(:@running, true)
+      collector = Thread.new { paged.send(:populate, paged.instance_variable_get(:@generation)) }
+
+      Timeout.timeout(3) { sleep 0.01 until requested_paths.size >= 1 }
+      paged.stop # lands while page 1 is still in flight
+      page_gate << nil # the in-flight request returns now
+
+      Timeout.timeout(3) { collector.join }
+      expect(requested_paths.size).to eq(1) # no page 2 was requested after the stop
+      expect(paged.store.list).to be_empty # the partial snapshot was never applied
+      expect(paged.synced).to be false
+    end
+
+    def item(name, rev)
+      { "metadata" => { "namespace" => "default", "name" => name, "resourceVersion" => rev } }
     end
   end
 
@@ -273,8 +624,8 @@ RSpec.describe KrubyController::Cache::Informer do
     it "records the sync error and does not wait forever for the watch" do
       allow(api_client).to receive(:build_request).and_return(double("request", run: response))
       allow(informer).to receive(:interruptible_sleep)
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       watch_started = false
       allow(fake_watch).to receive(:connect) { watch_started = true }
 
@@ -302,8 +653,8 @@ RSpec.describe KrubyController::Cache::Informer do
         { "items" => [], "metadata" => { "resourceVersion" => "100" } }
       end
       allow(informer).to receive(:interruptible_sleep)
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       synced_when_connected = []
       allow(fake_watch).to receive(:connect) { synced_when_connected << informer.synced }
 
@@ -385,8 +736,8 @@ RSpec.describe KrubyController::Cache::Informer do
     before do
       stub_const("#{described_class}::STOP_JOIN_TIMEOUT", 0.05)
       informer.add_handler(recorder)
-      watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(watch)
+      watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(watch)
       allow(watch).to receive(:connect) do |path, &callback|
         gate = ::Queue.new
         watch_gates << gate
@@ -577,6 +928,39 @@ RSpec.describe KrubyController::Cache::Informer do
       expect(informer).to have_received(:fetch_list).once
     end
 
+    it "relists immediately when the watch reports 410 Gone" do
+      allow(informer).to receive(:fetch_list).and_return(snapshot("current", "200"))
+      allow(informer).to receive(:interruptible_sleep).and_return(nil)
+      start_run
+      first = next_connection
+      events_before = recorder.events.dup
+
+      first[:gate] << { "type" => "ERROR", "object" => { "code" => 410, "reason" => "Expired" } }
+      second = next_connection
+
+      expect(informer).to have_received(:fetch_list).twice
+      expect(second[:path]).to include("resourceVersion=200")
+      # no event reached the handlers: ERROR is not data
+      expect(recorder.events).to eq(events_before)
+      # 410 relists without any backoff sleep
+      expect(informer).not_to have_received(:interruptible_sleep)
+    end
+
+    it "backs off before relisting on a non-410 ERROR event" do
+      allow(informer).to receive(:fetch_list).and_return(snapshot("current", "200"))
+      allow(informer).to receive(:interruptible_sleep).and_return(nil)
+      start_run
+      first = next_connection
+      events_before = recorder.events.dup
+
+      first[:gate] << { "type" => "ERROR", "object" => { "code" => 500, "reason" => "Internal" } }
+      second = next_connection
+
+      expect(informer).to have_received(:interruptible_sleep).with(1.0, anything)
+      expect(second[:path]).to include("resourceVersion=200")
+      expect(recorder.events).to eq(events_before)
+    end
+
     it "discards a relist response from a stopped run after restart" do
       calls = 0
       allow(informer).to receive(:fetch_list) do
@@ -670,8 +1054,8 @@ RSpec.describe KrubyController::Cache::Informer do
     end
 
     def stub_watch(&behavior)
-      fake_watch = instance_double(Kubernetes::Watch)
-      allow(Kubernetes::Watch).to receive(:new).and_return(fake_watch)
+      fake_watch = instance_double(KrubyController::Cache::WatchStream)
+      allow(KrubyController::Cache::WatchStream).to receive(:new).and_return(fake_watch)
       paths = []
       paths_mutex = Mutex.new
       allow(fake_watch).to receive(:connect) do |path, &block|

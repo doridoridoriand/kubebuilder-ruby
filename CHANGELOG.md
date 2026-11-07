@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Controller: `register` reopens a work queue closed by a previous lifecycle before resync, so the changes observed while leaderless are buffered on reacquisition (#52)
 
 ### Added
+- `examples/hello-world/`: a complete, runnable hello-world operator (CRD class + an idempotent reconciler that writes status + a kind runbook), verified end-to-end against a real kind cluster — List/Watch informer, the reconcile loop, a `cache.get` read, a status subresource write, create/update/delete, and SIGTERM shutdown (#17)
+- docs/design: §9.9 documents the process-exit constraint that E2E surfaced — the Typhoeus watch read has no cancellation API (`Typhoeus::Request` has no `#cancel`, `Thread#kill` cannot interrupt the libcurl read, and Ruby 3.4 removed `Thread#daemon`), so an operator's entry point calls `exit!` after `Manager#start` returns to guarantee the process terminates once the bounded logical shutdown has completed
 - Initial project skeleton
 - Specification and design documents
 - Core types: Request, Result, Reconciler

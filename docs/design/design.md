@@ -1635,6 +1635,27 @@ attribute :template, type: :object,
 **課題**: probe / metrics / webhook サーバーの accept スレッド、recorder のワーカースレッド、resync の timer スレッドは GVL を共有する。ただしいずれも主に I/O 待ちで、reconcile の I/O 待ち時間と並行実行される (§9.1 と同様)。
 **対応**: 影響小と判断。webhook の validate ロジックが CPU 重い場合はユーザー側で Thread 分離を検討する。
 
+### 9.9 停止時のプロセス退出 (kind E2E で判明、2026-11-07)
+
+**課題**: 実クラスタ (kind) での E2E で、SIGTERM 後の graceful shutdown が**プロセス退出でハング**することを判明した。原因は watch ワーカーが `WatchStream` の Typhoeus 読み取り (libcurl の blocking read) に常駐する点。`Manager#stop` は各ワーカーを**有界 join** (10s) で止め、超過した場合は警告を出して進める (§9.2 の WatchStream は自動再接続しないため、接続は server が close しない限り開いたまま)。しかしこの watch スレッドは non-daemon であり、`Manager#start` が返却してメインスレッドがスクリプト末尾に到達した時点で、**Ruby の通常の終了処理が non-daemon スレッドの完了を待ち、プロセスが退出しない**。
+
+**確認済みの制約 (実測)**: Typhoeus の watch 読み取りは外部から中断できない —
+- `Typhoeus::Request` に `#cancel` は存在しない (Ethon 下層の `cancel` は実行中のリクエストから呼ぶとデッドロックする恐れ)。
+- `Thread#kill` は libcurl の C レベル read を割り込めない (割り込み例外は C コールが VM に返った後に送られる)。
+- Ruby 3.4 は `Thread#daemon=` / `#daemon?` を**削除**した (3.3 は残存)。つまり「daemon スレッドにして終了をブロックさせない」経路が 3.4 で閉じている。
+- 非 daemon スレッドが I/O に常駐していると `Kernel#exit` もブロックする (実測)。
+
+**対応 (operator エントリポイントの契約)**: フレームワーク側は `Manager#stop` で論理シャットダウン (controller の drain・cache 停止・lease 解放) を**有界に**完了し、`Manager#start` を返却する。これは正しい。ただし常駐した watch ワーカーは OS レベルでしか消せないため、**operator の起動スクリプトは `Manager#start` が返却した後に `exit!` を呼ぶ**ことを定める。`exit!` は `#stop` が既に完了させたクリーンアップを再実行せず、常駐ワーカーを OS レベルで強制終了させる。これにより SIGTERM 後およそ 1 回の有界 join (10s) 程度でプロセスが確実に退出する (kind 実測: 約 11s で clean exit)。`examples/hello-world/hello_world.rb` がこのパターンを実装している。
+
+```ruby
+manager.start
+# #start は論理シャットダウン完了で返る。常駐しうる watch ワーカーを OS レベルで
+# 退出させるため、この後 exit! を呼ぶ (Typhoeus の watch read は中断 API なし)。
+exit!(0)
+```
+
+watch request には idle タイムアウトを付けない (§9.2、アイドル watch を kill しないため churn が生じる)。停止は `exit!` 経路に集約する。
+
 ---
 
 ## 10. テスト戦略

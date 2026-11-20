@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-20
+
 ### Fixed
 - Informer: watch events are classified — only ADDED/MODIFIED/DELETED reach the store and handlers, BOOKMARK only advances the resourceVersion, a 410 Gone ERROR relists immediately (no backoff) and other ERROR/unknown events never corrupt the RV; the watch stream is now the framework's own `WatchStream` (no automatic reconnection, so a 410 can no longer silently drop the missed event window as kruby's Watch does); failed responses surface Retry-After for the backoff (#45)
 - Informer: LIST follows `metadata.continue` across all pages, collecting the whole snapshot before an atomic apply — a mid-page failure leaves the store untouched and the retry starts from page 1; a missing snapshot resourceVersion is rejected instead of blinding the watch; `list_page_size` optionally sets the per-page limit (#45)

@@ -61,7 +61,12 @@ gem install kruby-controller        # インストール smoke
 ## 公開先について (要判断)
 
 - **rubygems.org** (推奨): 上記手順通り。gem 名 `kruby-controller` は未占有か
-  公開前に `gem search kruby-controller --remote` で確認。
-- **GitHub Packages**: `GEM_HOSTS` に GitHub Packages URL を追加し、`gem push`
-  前に `GEM_HOST` を GitHub に切り替える方式。`.netrc` に GitHub token 必要。
+  公開前に `gem search kruby-controller --remote` で再確認。
+- **GitHub Packages**: RubyGems は `GEM_HOSTS`/`GEM_HOST` を読まない
+  (`RUBYGEMS_HOST` または `--host` が push 先の切り替え)。`~/.gem/credentials`
+  に `:github: Bearer <PAT classic>` を登録して
+  `gem push --key github --host https://rubygems.pkg.github.com/doridoridoriand
+  kruby-controller-0.1.0.gem` で push する。
 - **非公開 / 内部のみ**: `gem push` を行わず、内部 registry への push を別途行う。
+  rubygems.org 以外を公開先にする場合は gemspec の `metadata["allowed_push_host"]`
+  を設定して rubygems.org への誤 push を防止する。

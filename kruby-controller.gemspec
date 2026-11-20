@@ -9,7 +9,7 @@ Gem::Specification.new do |spec|
   spec.description = "A controller-runtime equivalent for Ruby, built on kruby (Kubernetes Ruby client). " \
                      "Provides Reconcile Loop, Shared Cache, Event Handler, Leader Election, and more."
   spec.authors = ["Takahiro Ishida"]
-  spec.email = ["takahiro.ishida@cyberagent.co.jp"]
+  spec.email = ["i.am.eager.for.peace@gmail.com"]
 
   spec.homepage = "https://github.com/doridoridoriand/kubebuilder-ruby"
   spec.license = "Apache-2.0"

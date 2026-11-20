@@ -379,7 +379,7 @@ manager.start  # blocks
 | 依存 | 詳細 |
 |---|---|
 | kruby | Kubernetes API クライアント。Watch, ApiClient, Configuration を使用 |
-| Kubernetes クラスター | 開発時は kind / minikube。運用時は Cycloud k8s など |
+| Kubernetes クラスター | 開発時は kind / minikube。運用時は任意の Kubernetes クラスタ |
 | kubectl | CLI scaffolding で kubectl 構文を理解するために参照 (必須依存ではない) |
 | events.k8s.io API | F-14 EventRecorder が使用 (ApiClient 経由) |
 | admission.k8s.io | F-21 Webhook が受信するレビュー形式 (受信側のみ、クライアント API 不要) |

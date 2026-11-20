@@ -2,16 +2,17 @@
 
 [![Ruby](https://img.shields.io/badge/ruby-3.3+-brightgreen.svg)](https://www.ruby-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![CI](https://github.com/doridoridoriand/kubebuilder-ruby/actions/workflows/ci.yml/badge.svg)](https://github.com/doridoridoriand/kubebuilder-ruby/actions/workflows/ci.yml)
 
-**Kubernetes Controller Pattern を Ruby で。** kruby (Kubernetes Ruby client) を基盤としたカスタムコントローラー開発フレームワーク。
+**The Kubernetes controller pattern, in Ruby.** A framework for building custom controllers on top of kruby (the Kubernetes Ruby client).
 
-kubebuilder / controller-runtime のコンセプトを Ruby に移植。
+A Ruby port of the kubebuilder / controller-runtime concepts.
 
-## 概要
+## Overview
 
-Kubernetes のカスタムリソース (CRD) 用のコントローラーを Ruby で簡潔に書けるフレームワーク。
+A framework for writing controllers for Kubernetes custom resources (CRDs) in Ruby.
 
-次は登録とキャッシュ読み取りの最小例です。事前に対象 CRD のインストールと、List / Watch および Lease への RBAC が必要です。リソース作成や status 更新の処理は省略しています。
+The following is a minimal example of registering a reconciler and reading from the cache. Before running it, install the target CRD and grant RBAC for List / Watch and Lease. Handling resource creation and status updates is omitted for brevity.
 
 ```ruby
 require "kruby-controller"
@@ -44,21 +45,21 @@ manager.add(CronTaskReconciler, for: CronTask)
 manager.start
 ```
 
-## 機能
+## Features
 
-| 機能 | 状態 |
+| Feature | Status |
 |---|---|
-| Manager / reconcile / shared cache / leader election | 基本実装あり。同期順序や停止処理を含む信頼性の検証・修正が必要 |
-| Event handler / owner reference / finalizer / status | 基本実装あり |
-| CRD Generator / CLI `init`・`create api` | 基本実装あり。一部の schema や deploy 資産は未対応 |
-| 統合 client / イベント記録 / probe / metrics | 未実装 |
-| Webhook / 複数 version の conversion | 未実装 |
+| Manager / reconcile loop / shared cache / leader election | Basic implementation. Reliability aspects (sync ordering, shutdown paths) still need hardening |
+| Event handlers / owner references / finalizers / status | Basic implementation |
+| CRD generator / CLI `init` and `create api` | Basic implementation. Some schemas and deploy assets are not yet covered |
+| Integrated client / event recording / probes / metrics | Not implemented |
+| Webhooks / multi-version conversion | Not implemented |
 
-実装の有無は本番での検証や Kubebuilder との機能同等性を意味しません。詳細と残課題は[差分評価](docs/design/parity-review.md)を参照してください。
+The presence of an implementation does not imply production readiness or feature parity with Kubebuilder. See the [parity review](docs/design/parity-review.md) for details and remaining gaps.
 
-## ヘルパー (Finalizer / Status)
+## Helpers (Finalizer / Status)
 
-`FinalizerManager` / `StatusUpdater` は、`update` (オブジェクト全体の PUT) と `patch_status` (`/status` サブリソースの PATCH) を提供する client を必要とします。kruby の `CustomObjectsApi` にはこれらが存在しないため、本フレームワークの `KrubyController::KubernetesObjectClient` を client として渡します:
+`FinalizerManager` / `StatusUpdater` require a client that provides `update` (a PUT of the whole object) and `patch_status` (a PATCH on the `/status` subresource). kruby's `CustomObjectsApi` has neither, so pass the framework's `KrubyController::KubernetesObjectClient` as the client:
 
 ```ruby
 config = Kubernetes::Configuration.default_config
@@ -69,34 +70,48 @@ client = KrubyController::KubernetesObjectClient.new(api_client: api_client, gvk
 finalizers = KrubyController::Finalizer::FinalizerManager.new(client: client, gvk: gvk)
 status = KrubyController::Status::StatusUpdater.new(client: client, gvk: gvk)
 
-# reconcile 内
+# inside reconcile
 finalizers.add_finalizer(obj, "crontask.example.com/finalizer")
 status.update_status(obj, { "phase" => "Running" })
 ```
 
-## 要件
+## Requirements
 
 - Ruby 3.3+
 - kruby ~> 1.36
 - Kubernetes 1.31+
 
-## インストール
+## Installation
 
-初回リリース・公開先は未確定です ([#43](https://github.com/doridoridoriand/kubebuilder-ruby/issues/43))。開発時はこのリポジトリを取得し、`bundle install` を実行してください。
+Install the gem:
 
-## 開発
+```sh
+gem install kruby-controller
+```
+
+or add it to your Gemfile:
+
+```ruby
+gem "kruby-controller", "~> 0.1.0"
+```
+
+## Example
+
+A complete, runnable example operator lives in [examples/hello-world/](examples/hello-world/) — a CRD class plus an idempotent reconciler, verified end-to-end against a real kind cluster.
+
+## Development
 
 ```bash
 bundle install
 bundle exec rake
 ```
 
-## ドキュメント
+## Documentation
 
-- [仕様書](docs/design/specification.md)
-- [設計書](docs/design/design.md)
-- [本家との差分評価](docs/design/parity-review.md)
+- [Specification](docs/design/specification.md)
+- [Design document](docs/design/design.md)
+- [Parity review vs. upstream Kubebuilder](docs/design/parity-review.md)
 
 ## License
 
-Apache License 2.0 — [LICENSE](LICENSE)
+Apache License 2.0 — see [LICENSE](LICENSE).
